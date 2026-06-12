@@ -2559,6 +2559,35 @@ function codexSecurityQueueSummary(job, countRows, workerRows, dbPath, sessionId
   };
 }
 
+function launcherWorkerRecordsFromWorkerRows(workerRows) {
+  const records = new Map();
+  for (const row of workerRows || []) {
+    let metadata = {};
+    try {
+      metadata = row.metadata_json ? JSON.parse(row.metadata_json) : {};
+    } catch {
+      metadata = {};
+    }
+    mergeLauncherWorkerRecord(
+      records,
+      {
+        worker_id: row.worker_id || "",
+        thread_id: row.thread_id || "",
+        job_id: row.job_id || "",
+        status: row.status || "",
+        created_at: row.created_at,
+        updated_at: row.updated_at || row.last_queue_action_at || row.last_observed_at,
+        last_observed_at: row.last_observed_at,
+        last_queue_action_at: row.last_queue_action_at,
+        last_error: row.last_error || "",
+        metadata,
+      },
+      appTimestampMs(row.updated_at || row.last_queue_action_at || row.last_observed_at || row.created_at),
+    );
+  }
+  return records;
+}
+
 function codexSecurityActiveDiagnosticQueuesFromDb(dbPath, sessionId, linkedJobKeys) {
   const warnings = [];
   let jobs = [];
@@ -2591,7 +2620,7 @@ function codexSecurityActiveDiagnosticQueuesFromDb(dbPath, sessionId, linkedJobK
     );
     workerRows = sqliteJson(
       dbPath,
-      `SELECT job_id, worker_id, thread_id, status, created_at, updated_at,
+      `SELECT job_id, worker_id, thread_id, status, metadata_json, created_at, updated_at,
               last_observed_at, last_queue_action_at, last_error
        FROM worker_runs
        WHERE job_id IN (${jobFilter})
@@ -2723,7 +2752,7 @@ function loadCodexSecurityQueueDataFromDb(dbPath, jobIds, options = {}) {
     );
     workerRows = sqliteJson(
       dbPath,
-      `SELECT job_id, worker_id, thread_id, status, created_at, updated_at,
+      `SELECT job_id, worker_id, thread_id, status, metadata_json, created_at, updated_at,
               last_observed_at, last_queue_action_at, last_error
        FROM worker_runs
        WHERE job_id IN (${jobFilter})
@@ -2819,6 +2848,10 @@ function loadCodexSecurityQueueDataFromDb(dbPath, jobIds, options = {}) {
     namespaces: [],
     queues: normalizedQueues,
     workers: queueWorkerSessions(normalizedItems, normalizedQueues),
+    appWorkers: launcherWorkerSessions(
+      launcherWorkerRecordsFromWorkerRows(workerRows),
+      options.sessionId || "",
+    ),
     timeline: queueTimeline,
     items: normalizedItems,
     stats,
@@ -2860,6 +2893,7 @@ function mergeQueueData(parts) {
     dbPaths,
     namespaces: filtered.flatMap((part) => part.namespaces || []),
     queues,
+    appWorkers: mergedAppThreadSessions(filtered.flatMap((part) => part.appWorkers || [])),
     workers: queueWorkerSessions(items, queues),
     timeline,
     items,
@@ -3562,13 +3596,18 @@ function augmentRunningToolDiagnostics(parent, children, source) {
 }
 
 function completeSessionPayload({ codexHome, source, parent, children, queue }) {
-  const appThreads = parent.appThreads || [];
-  const queueWorkers = queue.workers || [];
+  const queueForPayload = { ...queue };
+  const appThreads = mergedAppThreadSessions([
+    ...(parent.appThreads || []),
+    ...(queueForPayload.appWorkers || []),
+  ]);
+  delete queueForPayload.appWorkers;
+  const queueWorkers = queueForPayload.workers || [];
   const parentSession = { ...parent };
   delete parentSession.appThreads;
   augmentRunningToolDiagnostics(parent, children, source);
-  const domain = domainFor(parent, children, queue, appThreads, queueWorkers);
-  const warnings = [...(queue.warnings || [])];
+  const domain = domainFor(parent, children, queueForPayload, appThreads, queueWorkers);
+  const warnings = [...(queueForPayload.warnings || [])];
   const spawnedIds = new Set(parent.spawned.filter((s) => s.status === "spawned").map((s) => s.id));
   const parsedChildIds = new Set(children.map((c) => c.id));
   for (const id of spawnedIds) {
@@ -3586,7 +3625,7 @@ function completeSessionPayload({ codexHome, source, parent, children, queue }) 
     subagents: children,
     appThreads,
     queueWorkers,
-    queue,
+    queue: queueForPayload,
     domain,
     warnings,
   };
