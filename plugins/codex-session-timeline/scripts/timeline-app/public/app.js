@@ -29,6 +29,7 @@ const timelinePanLeft = document.getElementById("timeline-pan-left");
 const timelinePanRight = document.getElementById("timeline-pan-right");
 const timelineReset = document.getElementById("timeline-reset");
 const loadFullDetailsButton = document.getElementById("load-full-details");
+const loadAllEventsButton = document.getElementById("load-all-events");
 const subagentsPanel = document.getElementById("subagents");
 const subagentTable = document.getElementById("subagent-table");
 const queuesPanel = document.getElementById("queues");
@@ -48,6 +49,7 @@ let queueRefreshTimer = null;
 let queueRefreshInFlight = false;
 let queueLastRefreshed = null;
 let fullDetailsLoading = false;
+let allEventsLoading = false;
 let timelineView = null;
 let timelineDrag = null;
 let markerLookup = new Map();
@@ -168,10 +170,60 @@ function agentJobId(session) {
   return kind.startsWith("agent_job:") ? kind.slice("agent_job:".length) : "";
 }
 
+function stripUuidPrefix(value) {
+  return String(value || "").replace(
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}[-_:]*/i,
+    "",
+  );
+}
+
+function humanizeWorkerSlug(value) {
+  return String(value || "")
+    .replace(/^deep[-_]+/i, "")
+    .replace(/[-_]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function workerNumberFromId(workerId) {
+  const match = String(workerId || "").match(/(?:^|[-_])worker[-_]?(\d+)$/i);
+  return match ? match[1] : "";
+}
+
+function workerRoleFromSource(source, fallback = "") {
+  const workerId = source?.worker_id || fallback || "";
+  const candidates = [
+    source?.job_id,
+    ...(Array.isArray(source?.queues) ? source.queues : []),
+    workerId.replace(/(?:^|[-_])worker[-_]?\d+$/i, ""),
+  ];
+
+  for (const candidate of candidates) {
+    const cleaned = stripUuidPrefix(candidate);
+    const roleMatch = cleaned.match(
+      /(?:^|[-_])(deep[-_]+file[-_]+review|deep[-_]+threat[-_]+model|file[-_]+review|threat[-_]+model|cvss[-_]+scoring|finding[-_]+discovery|validation|rerank|triage)(?=$|[-_])/i,
+    );
+    const role = humanizeWorkerSlug(roleMatch ? roleMatch[1] : cleaned);
+    if (role && !/^[0-9a-f-]{8,}$/i.test(role)) return role;
+  }
+
+  return "";
+}
+
+function workerDisplayName(source, fallback = "") {
+  const workerId = source?.worker_id || fallback || "";
+  const number = workerNumberFromId(workerId);
+  const role = workerRoleFromSource(source, fallback);
+  if (role && number) return `${role} #${number}`;
+  if (role) return role;
+  if (number) return `worker #${number}`;
+  return stripUuidPrefix(workerId) || fallback;
+}
+
 function childSessionDisplay(session) {
   if (isQueueWorkerSession(session)) {
     const source = session.meta?.source?.queue_worker || {};
-    const name = source.worker_id || session.meta?.agentNickname || session.title || session.id.slice(0, 13);
+    const name = workerDisplayName(source, session.meta?.agentNickname || session.title || session.id.slice(0, 13));
     return {
       lanePrefix: "queue worker",
       name,
@@ -183,7 +235,7 @@ function childSessionDisplay(session) {
 
   if (isAppThreadSession(session)) {
     const source = session.meta?.source?.app_server || {};
-    const name = source.worker_id || session.meta?.agentNickname || session.title || session.id.slice(0, 13);
+    const name = workerDisplayName(source, session.meta?.agentNickname || session.title || session.id.slice(0, 13));
     const lanePrefix = source.worker_id ? "app worker" : "app thread";
     return {
       lanePrefix,
@@ -282,7 +334,14 @@ function appThreadTaskSummary(session) {
   if (source.events_file) lines.push(`Events file: ${source.events_file}`);
   if (source.done_file) lines.push(`Done file: ${source.done_file}`);
   if (source.event_rows != null) {
-    lines.push(`Launcher event rows parsed: ${source.event_rows}${source.event_rows_truncated ? " (truncated)" : ""}`);
+    const loaded = source.event_rows_loaded ?? source.event_rows;
+    const omitted = source.event_rows_omitted || 0;
+    const rowWindow = source.event_rows_window === "latest" ? "latest" : "all";
+    lines.push(
+      `Launcher event rows parsed: ${loaded}/${source.event_rows}${
+        source.event_rows_truncated ? ` (${rowWindow}; ${omitted} older omitted)` : ""
+      }`,
+    );
   }
   if (source.prompt) {
     const promptLabel = String(source.created_via || "").includes("launcher")
@@ -502,6 +561,41 @@ function updateFullDetailsButton() {
   loadFullDetailsButton.textContent = full ? "All details loaded" : "Load all details";
 }
 
+function launcherEventSummary(data) {
+  const sources = (data?.appThreads || [])
+    .map((thread) => thread?.meta?.source?.app_server)
+    .filter(Boolean);
+  const total = sources.reduce((sum, source) => sum + Number(source.event_rows || 0), 0);
+  const loaded = sources.reduce(
+    (sum, source) => sum + Number(source.event_rows_loaded ?? source.event_rows ?? 0),
+    0,
+  );
+  const truncated = sources.some((source) => source.event_rows_truncated);
+  return { total, loaded, truncated };
+}
+
+function updateAllEventsButton() {
+  if (!loadAllEventsButton) return;
+  if (!currentData) {
+    loadAllEventsButton.hidden = true;
+    loadAllEventsButton.disabled = true;
+    return;
+  }
+  const summary = launcherEventSummary(currentData);
+  loadAllEventsButton.hidden = !summary.total;
+  if (loadAllEventsButton.hidden) return;
+  if (allEventsLoading) {
+    loadAllEventsButton.disabled = true;
+    loadAllEventsButton.textContent = "Loading all events...";
+    return;
+  }
+  const allLoaded = currentData.launcherEventsMode === "all" || !summary.truncated;
+  loadAllEventsButton.disabled = allLoaded;
+  loadAllEventsButton.textContent = allLoaded
+    ? "All events loaded"
+    : `Load all events (${fmtCount(summary.loaded)}/${fmtCount(summary.total)})`;
+}
+
 function setQueueRefreshStatus(text, className = "") {
   if (!queueRefreshStatus) return;
   queueRefreshStatus.textContent = text;
@@ -677,11 +771,13 @@ async function loadSession(sessionId) {
   const codexHome = currentCodexHome();
   timelineView = null;
   fullDetailsLoading = false;
+  allEventsLoading = false;
   stopQueueAutoRefresh();
   if (queueAutoRefresh) queueAutoRefresh.checked = false;
   setQueueRefreshStatus("Not refreshed yet");
   currentData = null;
   updateFullDetailsButton();
+  updateAllEventsButton();
   closeMarkerPopover();
   updateStatus(`Loading ${sessionId}${remote ? ` from ${remote}` : codexHome ? " from custom CODEX_HOME" : ""}...`);
   summaryEl.hidden = true;
@@ -722,6 +818,33 @@ async function loadFullDetails() {
   } finally {
     fullDetailsLoading = false;
     updateFullDetailsButton();
+  }
+}
+
+async function loadAllEvents() {
+  if (!currentData?.session?.id || allEventsLoading) return;
+  const sessionId = currentData.session.id;
+  const previousView = activeView;
+  const previousTimelineView = timelineView ? { ...timelineView } : null;
+  const full = currentData.detailMode === "full" || currentData.detailsComplete;
+  allEventsLoading = true;
+  updateAllEventsButton();
+  updateStatus(`Loading all launcher events for ${sessionId}...`);
+  try {
+    const res = await fetch(
+      `/api/session/${encodeURIComponent(sessionId)}${apiQueryString({ full: full ? 1 : "", events: "all" })}`,
+    );
+    const data = await res.json();
+    if (!res.ok || !data.ok) throw new Error(data.error || "Unable to load all launcher events.");
+    currentData = data;
+    timelineView = previousTimelineView;
+    render(data);
+    setActiveView(previousView);
+  } catch (err) {
+    updateStatus(err.message || "Unable to load all launcher events.", "");
+  } finally {
+    allEventsLoading = false;
+    updateAllEventsButton();
   }
 }
 
@@ -777,6 +900,7 @@ function render(data) {
   renderTimeline(data);
   updateTimelineControls(data);
   updateFullDetailsButton();
+  updateAllEventsButton();
   timelineCard.hidden = false;
 
   renderQueues(queue);
@@ -2293,6 +2417,7 @@ timelinePanLeft.addEventListener("click", () => panTimeline(-0.5));
 timelinePanRight.addEventListener("click", () => panTimeline(0.5));
 timelineReset.addEventListener("click", resetTimeline);
 loadFullDetailsButton?.addEventListener("click", loadFullDetails);
+loadAllEventsButton?.addEventListener("click", loadAllEvents);
 
 timelineWrap.addEventListener(
   "wheel",

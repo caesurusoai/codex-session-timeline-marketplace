@@ -1329,12 +1329,40 @@ function readOptionalText(filePath, maxChars = 8000) {
   }
 }
 
-function launcherEventRows(filePath) {
+function launcherEventRows(filePath, options = {}) {
   if (!filePath || !fs.existsSync(filePath)) return { rows: [], totalRows: 0, truncated: false };
   const rows = readJsonl(filePath);
+  const allEvents = options.launcherEventsMode === "all";
+  if (allEvents) {
+    return {
+      rows,
+      totalRows: rows.length,
+      retainedRows: rows.length,
+      omittedRows: 0,
+      truncated: false,
+      window: "all",
+    };
+  }
   const limit = Math.max(0, Number(MAX_LAUNCHER_EVENT_ROWS) || 0);
-  if (!limit || rows.length <= limit) return { rows, totalRows: rows.length, truncated: false };
-  return { rows: rows.slice(0, limit), totalRows: rows.length, truncated: true };
+  if (!limit || rows.length <= limit) {
+    return {
+      rows,
+      totalRows: rows.length,
+      retainedRows: rows.length,
+      omittedRows: 0,
+      truncated: false,
+      window: "all",
+    };
+  }
+  const start = rows.length - limit;
+  return {
+    rows: rows.slice(start),
+    totalRows: rows.length,
+    retainedRows: limit,
+    omittedRows: start,
+    truncated: true,
+    window: "latest",
+  };
 }
 
 function launcherToolCallFromItem(item, start) {
@@ -1388,8 +1416,8 @@ function launcherSpanFromCall(call, end, output, parsed = null, wallMs = null, e
   };
 }
 
-function parseLauncherEvents(filePath) {
-  const { rows, totalRows, truncated } = launcherEventRows(filePath);
+function parseLauncherEvents(filePath, options = {}) {
+  const { rows, totalRows, retainedRows, omittedRows, truncated, window } = launcherEventRows(filePath, options);
   const toolCalls = new Map();
   const itemStarts = new Map();
   const spans = [];
@@ -1534,7 +1562,10 @@ function parseLauncherEvents(filePath) {
     start,
     end,
     totalRows,
+    retainedRows,
+    omittedRows,
     truncated,
+    window,
   };
 }
 
@@ -1562,7 +1593,11 @@ function launcherWorkerDetail(record, promptText, eventInfo) {
     launcher.status_file ? `Status file: ${launcher.status_file}` : "",
     launcher.done_file ? `Done file: ${launcher.done_file}` : "",
     launcher.events_file ? `Events file: ${launcher.events_file}` : "",
-    eventInfo?.totalRows != null ? `Launcher event rows: ${eventInfo.totalRows}${eventInfo.truncated ? " (truncated)" : ""}` : "",
+    eventInfo?.totalRows != null
+      ? `Launcher event rows: ${eventInfo.retainedRows ?? eventInfo.totalRows}/${eventInfo.totalRows}${
+          eventInfo.truncated ? " (latest rows; older rows omitted)" : ""
+        }`
+      : "",
     error ? `Error:\n${safeJson(error)}` : "",
     promptText ? `Prompt:\n${promptText}` : "",
   ]
@@ -1570,7 +1605,7 @@ function launcherWorkerDetail(record, promptText, eventInfo) {
     .join("\n\n");
 }
 
-function launcherWorkerSessions(records, parentId) {
+function launcherWorkerSessions(records, parentId, options = {}) {
   const result = [];
   for (let record of records.values()) {
     record = launcherWorkerWithDoneFile(record);
@@ -1578,7 +1613,7 @@ function launcherWorkerSessions(records, parentId) {
     const threadId = record.threadId || launcher.thread_id || "";
     const workerId = record.workerId || launcher.worker_id || threadId || "app-server worker";
     const eventsFile = launcher.events_file || "";
-    const eventInfo = parseLauncherEvents(eventsFile);
+    const eventInfo = parseLauncherEvents(eventsFile, options);
     const promptText = readOptionalText(record.promptFile);
     const doneMs = launcherDoneMs(record);
     const markers = [...eventInfo.markers];
@@ -1664,7 +1699,10 @@ function launcherWorkerSessions(records, parentId) {
             done_file: launcher.done_file || "",
             prompt: promptText,
             event_rows: eventInfo.totalRows,
+            event_rows_loaded: eventInfo.retainedRows ?? eventInfo.totalRows,
+            event_rows_omitted: eventInfo.omittedRows || 0,
             event_rows_truncated: eventInfo.truncated,
+            event_rows_window: eventInfo.window || "all",
           },
         },
         threadSource: "app_server",
@@ -1732,7 +1770,7 @@ function unionMs(intervals) {
   return total;
 }
 
-function parseSessionRows(rows, filePath, indexEntry) {
+function parseSessionRows(rows, filePath, indexEntry, options = {}) {
   const toolCalls = new Map();
   const terminalSessions = new Map();
   const spans = [];
@@ -1978,13 +2016,13 @@ function parseSessionRows(rows, filePath, indexEntry) {
     namespaces: [...namespaces],
     appThreads: mergedAppThreadSessions([
       ...appThreadSessions(appThreads, meta.id || indexEntry?.id || path.basename(filePath)),
-      ...launcherWorkerSessions(launcherWorkers, meta.id || indexEntry?.id || path.basename(filePath)),
+      ...launcherWorkerSessions(launcherWorkers, meta.id || indexEntry?.id || path.basename(filePath), options),
     ]),
   };
 }
 
-function parseSessionFile(filePath, indexEntry) {
-  return parseSessionRows(readJsonl(filePath), filePath, indexEntry);
+function parseSessionFile(filePath, indexEntry, options = {}) {
+  return parseSessionRows(readJsonl(filePath), filePath, indexEntry, options);
 }
 
 function collectNamespaces(value, result = new Set()) {
@@ -2851,6 +2889,7 @@ function loadCodexSecurityQueueDataFromDb(dbPath, jobIds, options = {}) {
     appWorkers: launcherWorkerSessions(
       launcherWorkerRecordsFromWorkerRows(workerRows),
       options.sessionId || "",
+      options,
     ),
     timeline: queueTimeline,
     items: normalizedItems,
@@ -3146,14 +3185,14 @@ function loadQueueDataFromDb(dbPath, sessionId, namespaceHints) {
   };
 }
 
-function loadQueueData(sessionId, namespaceHints, appThreads = [], codexHome = CODEX_HOME) {
+function loadQueueData(sessionId, namespaceHints, appThreads = [], codexHome = CODEX_HOME, options = {}) {
   const queueService = loadQueueDataFromDb(QUEUE_DB, sessionId, namespaceHints);
   const codexSecurityHints = mergeCodexSecurityQueueHints([
     ...codexSecurityQueueHintsFromAppThreads(appThreads),
     ...codexSecurityQueueHintsFromParentThread(sessionId, codexHome),
   ]);
   const codexSecurityQueues = codexSecurityHints.map((hint) =>
-    loadCodexSecurityQueueDataFromDb(hint.dbPath, hint.jobIds, { sessionId }),
+    loadCodexSecurityQueueDataFromDb(hint.dbPath, hint.jobIds, { ...options, sessionId }),
   );
   const queue = mergeQueueData([queueService, ...codexSecurityQueues]);
   const diagnostics = discoverRelatedCodexSecurityDiagnostics(sessionId, codexSecurityHints, codexHome);
@@ -3216,7 +3255,7 @@ function syncRemoteQueueDb(remoteName, host) {
   }
 }
 
-function loadRemoteQueueData(sessionId, namespaceHints, remoteName, host) {
+function loadRemoteQueueData(sessionId, namespaceHints, remoteName, host, options = {}) {
   const { dbPath, synced, warning } = syncRemoteQueueDb(remoteName, host);
   if (!synced) return emptyQueue(dbPath, warning ? [warning] : []);
   const queue = loadQueueDataFromDb(dbPath, sessionId, namespaceHints);
@@ -3797,7 +3836,7 @@ function mergedAppThreadSessions(sessions) {
   return [...byId.values()].sort((a, b) => clampNumber(a.start) - clampNumber(b.start));
 }
 
-function buildLocalSessionPayload(sessionId, codexHome = CODEX_HOME) {
+function buildLocalSessionPayload(sessionId, codexHome = CODEX_HOME, options = {}) {
   const index = loadSessionIndex(codexHome);
   const sessionFile = resolveSessionFile(sessionId, codexHome);
   if (!sessionFile) {
@@ -3811,7 +3850,7 @@ function buildLocalSessionPayload(sessionId, codexHome = CODEX_HOME) {
     };
   }
 
-  const parent = parseSessionFile(sessionFile, index.get(sessionId));
+  const parent = parseSessionFile(sessionFile, index.get(sessionId), options);
   const childRefs = findChildSessionFiles(
     sessionId,
     parent.spawned.filter((s) => s.status === "spawned").map((s) => s.id),
@@ -3819,7 +3858,7 @@ function buildLocalSessionPayload(sessionId, codexHome = CODEX_HOME) {
   );
   const children = parsedChildSessions(
     sessionId,
-    childRefs.map((child) => parseSessionFile(child.filePath, index.get(child.id))),
+    childRefs.map((child) => parseSessionFile(child.filePath, index.get(child.id), options)),
   );
 
   const queue = loadQueueData(
@@ -3827,6 +3866,7 @@ function buildLocalSessionPayload(sessionId, codexHome = CODEX_HOME) {
     namespaceHintsFor(parent, children, parent.appThreads || []),
     parent.appThreads || [],
     codexHome,
+    options,
   );
   return completeSessionPayload({
     codexHome,
@@ -3837,7 +3877,7 @@ function buildLocalSessionPayload(sessionId, codexHome = CODEX_HOME) {
   });
 }
 
-function buildRemoteSessionPayload(sessionId, remoteName, host) {
+function buildRemoteSessionPayload(sessionId, remoteName, host, options = {}) {
   const index = loadRemoteSessionIndex(host);
   const sessionFile = resolveRemoteSessionFile(host, sessionId);
   if (!sessionFile) {
@@ -3851,7 +3891,7 @@ function buildRemoteSessionPayload(sessionId, remoteName, host) {
     };
   }
 
-  const parent = parseSessionRows(readRemoteJsonl(host, sessionFile), `${remoteName}:${sessionFile}`, index.get(sessionId));
+  const parent = parseSessionRows(readRemoteJsonl(host, sessionFile), `${remoteName}:${sessionFile}`, index.get(sessionId), options);
   const childRefs = findRemoteChildSessionFiles(
     host,
     sessionId,
@@ -3860,11 +3900,11 @@ function buildRemoteSessionPayload(sessionId, remoteName, host) {
   const children = parsedChildSessions(
     sessionId,
     childRefs.map((child) =>
-      parseSessionRows(readRemoteJsonl(host, child.filePath), `${remoteName}:${child.filePath}`, index.get(child.id)),
+      parseSessionRows(readRemoteJsonl(host, child.filePath), `${remoteName}:${child.filePath}`, index.get(child.id), options),
     ),
   );
 
-  const queue = loadRemoteQueueData(sessionId, namespaceHintsFor(parent, children, parent.appThreads || []), remoteName, host);
+  const queue = loadRemoteQueueData(sessionId, namespaceHintsFor(parent, children, parent.appThreads || []), remoteName, host, options);
   return completeSessionPayload({
     codexHome: `${host}:~/.codex`,
     source: { type: "remote", remote: remoteName, host },
@@ -3876,13 +3916,13 @@ function buildRemoteSessionPayload(sessionId, remoteName, host) {
 
 function buildSessionPayload(sessionId, options = {}) {
   const remoteName = options.remote || "";
-  if (remoteName) return buildRemoteSessionPayload(sessionId, remoteName, resolveRemoteHost(remoteName));
-  return buildLocalSessionPayload(sessionId, resolveCodexHome(options.codexHome));
+  if (remoteName) return buildRemoteSessionPayload(sessionId, remoteName, resolveRemoteHost(remoteName), options);
+  return buildLocalSessionPayload(sessionId, resolveCodexHome(options.codexHome), options);
 }
 
-function buildLocalSessionQueuePayload(sessionId, codexHome = CODEX_HOME) {
+function buildLocalSessionQueuePayload(sessionId, codexHome = CODEX_HOME, options = {}) {
   const index = loadSessionIndex(codexHome);
-  const queue = loadQueueData(sessionId, [], [], codexHome);
+  const queue = loadQueueData(sessionId, [], [], codexHome, options);
   const indexEntry = index.get(sessionId) || {};
   return {
     ok: true,
@@ -3901,7 +3941,7 @@ function buildLocalSessionQueuePayload(sessionId, codexHome = CODEX_HOME) {
 function buildSessionQueuePayload(sessionId, options = {}) {
   const remoteName = options.remote || "";
   if (!remoteName) {
-    return buildLocalSessionQueuePayload(sessionId, resolveCodexHome(options.codexHome));
+    return buildLocalSessionQueuePayload(sessionId, resolveCodexHome(options.codexHome), options);
   }
   const payload = buildSessionPayload(sessionId, options);
   if (!payload.ok) return payload;
@@ -3916,6 +3956,26 @@ function buildSessionQueuePayload(sessionId, options = {}) {
     queue: payload.queue,
     queueWorkers: payload.queueWorkers || payload.queue?.workers || [],
     warnings: payload.warnings || [],
+  };
+}
+
+function requestOptionsFromSearch(searchParams) {
+  const launcherEvents = String(
+    searchParams.get("events") || searchParams.get("launcher_events") || "",
+  ).toLowerCase();
+  return {
+    remote: searchParams.get("remote") || "",
+    codexHome: searchParams.get("codex_home") || searchParams.get("codexHome") || "",
+    launcherEventsMode: ["all", "full"].includes(launcherEvents) ? "all" : "latest",
+  };
+}
+
+function withLauncherEventMode(payload, options) {
+  if (!payload?.ok) return payload;
+  return {
+    ...payload,
+    launcherEventsMode: options.launcherEventsMode || "latest",
+    launcherEventLimit: MAX_LAUNCHER_EVENT_ROWS,
   };
 }
 
@@ -3999,9 +4059,8 @@ const server = http.createServer((req, res) => {
       return;
     }
     try {
-      const remote = parsed.searchParams.get("remote") || "";
-      const codexHome = parsed.searchParams.get("codex_home") || parsed.searchParams.get("codexHome") || "";
-      const payload = buildSessionQueuePayload(sessionId, { remote, codexHome });
+      const options = requestOptionsFromSearch(parsed.searchParams);
+      const payload = withLauncherEventMode(buildSessionQueuePayload(sessionId, options), options);
       sendJson(res, payload.ok ? 200 : 404, payload);
     } catch (err) {
       sendJson(res, 500, { ok: false, error: err.message, stack: process.env.DEBUG ? err.stack : undefined });
@@ -4017,10 +4076,9 @@ const server = http.createServer((req, res) => {
       return;
     }
     try {
-      const remote = parsed.searchParams.get("remote") || "";
-      const codexHome = parsed.searchParams.get("codex_home") || parsed.searchParams.get("codexHome") || "";
       const full = ["1", "true", "yes"].includes(String(parsed.searchParams.get("full") || "").toLowerCase());
-      const payload = buildSessionPayload(sessionId, { remote, codexHome });
+      const options = requestOptionsFromSearch(parsed.searchParams);
+      const payload = withLauncherEventMode(buildSessionPayload(sessionId, options), options);
       const responsePayload = full ? { ...payload, detailMode: "full", detailsComplete: true } : compactSessionPayload(payload);
       sendJson(res, responsePayload.ok ? 200 : 404, responsePayload);
     } catch (err) {
