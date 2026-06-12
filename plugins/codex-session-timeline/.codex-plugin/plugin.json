@@ -1,0 +1,28 @@
+{
+  "name": "codex-session-timeline",
+  "version": "0.1.4+codex.20260612144046",
+  "description": "Visualize Codex session timing, tool waits, subagents, and queue activity.",
+  "author": {
+    "name": "Local developer"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex Session Timeline",
+    "shortDescription": "Visualize Codex sessions and queue timing.",
+    "longDescription": "Codex Session Timeline runs a local dashboard for inspecting Codex session JSONL files, explicit waits, tool calls, subagent activity, and queue lifetimes. It supports local sessions, configured SSH remotes, drag-to-zoom timelines, and clickable event/tool details.",
+    "developerName": "Local developer",
+    "category": "Productivity",
+    "logo": "./assets/logo.svg",
+    "composerIcon": "./assets/composer-icon.svg",
+    "capabilities": [
+      "Interactive",
+      "Local"
+    ],
+    "defaultPrompt": [
+      "Open a Codex session timeline.",
+      "Show timing for this session id.",
+      "Inspect waits and tool calls."
+    ],
+    "brandColor": "#0F8B8D"
+  }
+}

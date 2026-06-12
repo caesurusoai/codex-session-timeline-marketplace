@@ -1,0 +1,20 @@
+{
+  "name": "codex-session-timeline",
+  "interface": {
+    "displayName": "Codex Session Timeline"
+  },
+  "plugins": [
+    {
+      "name": "codex-session-timeline",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex-session-timeline"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

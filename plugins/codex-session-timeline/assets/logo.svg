@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Codex Session Timeline">
+  <rect width="128" height="128" rx="24" fill="#0f8b8d"/>
+  <path d="M22 79h84" stroke="#e6fffb" stroke-width="8" stroke-linecap="round"/>
+  <path d="M26 49h28m20 0h28" stroke="#ffffff" stroke-width="8" stroke-linecap="round"/>
+  <circle cx="64" cy="49" r="10" fill="#172033"/>
+  <circle cx="42" cy="79" r="8" fill="#ffffff"/>
+  <circle cx="88" cy="79" r="8" fill="#ffffff"/>
+</svg>
