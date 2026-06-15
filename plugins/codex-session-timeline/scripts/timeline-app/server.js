@@ -21,7 +21,7 @@ const QUEUE_DB = path.resolve(
   ).replace(/^~/, os.homedir()),
 );
 const PORT = Number(process.env.PORT || 8787);
-const MAX_QUEUE_ITEMS = Math.max(1, Number(process.env.MAX_QUEUE_ITEMS || 200) || 200);
+const MAX_QUEUE_ITEMS = Math.max(1, Number(process.env.MAX_QUEUE_ITEMS || 2500) || 2500);
 const MAX_QUEUE_TIMELINE_ITEMS = Math.max(
   1,
   Number(process.env.MAX_QUEUE_TIMELINE_ITEMS || 200000) || 200000,
@@ -29,19 +29,19 @@ const MAX_QUEUE_TIMELINE_ITEMS = Math.max(
 const QUEUE_TIMELINE_BINS = Math.max(1, Number(process.env.QUEUE_TIMELINE_BINS || 180) || 180);
 const MAX_MARKER_DETAIL_CHARS = Number(process.env.MAX_MARKER_DETAIL_CHARS || 8000);
 const MAX_SPAN_DETAIL_CHARS = Number(process.env.MAX_SPAN_DETAIL_CHARS || 12000);
-const COMPACT_SPAN_DETAIL_CHARS = Number(process.env.COMPACT_SPAN_DETAIL_CHARS || 1400);
-const COMPACT_MARKER_DETAIL_CHARS = Number(process.env.COMPACT_MARKER_DETAIL_CHARS || 900);
-const COMPACT_PREVIEW_CHARS = Number(process.env.COMPACT_PREVIEW_CHARS || 700);
 const REMOTE_SESSION_MAX_BUFFER = Number(process.env.REMOTE_SESSION_MAX_BUFFER_MB || 512) * 1024 * 1024;
 const REMOTE_CACHE_DIR = path.join(os.homedir(), ".cache", "codex-session-timeline", "remote");
 const SQLITE_COPY_DIR = path.join(os.tmpdir(), "codex-session-timeline-sqlite");
 const MAX_RUNNING_DIAGNOSTIC_ITEMS = Number(process.env.MAX_RUNNING_DIAGNOSTIC_ITEMS || 8);
-const MAX_LAUNCHER_EVENT_ROWS = Number(process.env.MAX_LAUNCHER_EVENT_ROWS || 500);
+const MAX_LAUNCHER_EVENT_ROWS = Number(process.env.MAX_LAUNCHER_EVENT_ROWS || 5000);
 const MAX_LAUNCHER_WORKER_FILES = Number(process.env.MAX_LAUNCHER_WORKER_FILES || 500);
-const MAX_CHILD_SESSION_DEPTH = Math.max(1, Number(process.env.MAX_CHILD_SESSION_DEPTH || 4) || 4);
-const MAX_CHILD_SESSIONS = Math.max(1, Number(process.env.MAX_CHILD_SESSIONS || 1000) || 1000);
 const COMPACTION_DEDUPE_WINDOW_MS = 100;
+const DEFAULT_REMOTE_HOSTS = {
+  nuc: "caesurus-nuc",
+  "caesurus-nuc": "caesurus-nuc",
+};
 const REMOTE_HOSTS = {
+  ...DEFAULT_REMOTE_HOSTS,
   ...parseRemoteHosts(process.env.CODEX_TIMELINE_REMOTE_HOSTS || ""),
 };
 
@@ -78,10 +78,7 @@ function resolveRemoteHost(remoteName) {
   const host = REMOTE_HOSTS[remoteName];
   if (!host) {
     const choices = Object.keys(REMOTE_HOSTS).sort().join(", ");
-    const suffix = choices
-      ? ` Known remotes: ${choices}`
-      : " Configure remotes with CODEX_TIMELINE_REMOTE_HOSTS=name=ssh-host.";
-    throw new Error(`Unknown remote '${remoteName}'.${suffix}`);
+    throw new Error(`Unknown remote '${remoteName}'. Known remotes: ${choices}`);
   }
   return host;
 }
@@ -104,7 +101,7 @@ function resolveCodexHome(value = "") {
 }
 
 function sendJson(res, status, body) {
-  const payload = JSON.stringify(body);
+  const payload = JSON.stringify(body, null, 2);
   res.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
     "cache-control": "no-store",
@@ -294,110 +291,42 @@ function sessionIdFromFilePath(filePath) {
   return match ? match[1] : "";
 }
 
-function parentThreadIdFromFirstLine(firstLine) {
-  const match = String(firstLine || "").match(/"parent_thread_id":"([^"]+)"/);
-  return match ? match[1] : "";
-}
-
-function localSessionFileRecords(codexHome = CODEX_HOME) {
+function indexLocalSessionFiles(codexHome = CODEX_HOME) {
   const roots = [
     path.join(codexHome, "sessions"),
     path.join(codexHome, "archived_sessions"),
   ];
-  const records = [];
+  const byId = new Map();
+  const byParent = new Map();
 
   for (const root of roots) {
     walkJsonl(root, (filePath) => {
       const id = sessionIdFromFilePath(filePath);
-      if (!id) return;
-      let first = "";
+      if (id) byId.set(id, filePath);
+
       try {
-        first = readFirstLine(filePath);
+        const first = readFirstLine(filePath);
+        const row = JSON.parse(first);
+        const parentId = row?.payload?.parent_thread_id || "";
+        if (!parentId) return;
+        if (!byParent.has(parentId)) byParent.set(parentId, new Map());
+        byParent.get(parentId).set(id || filePath, filePath);
       } catch {
-        // Ignore unreadable rollouts.
+        // Ignore unreadable or non-standard rollout files.
       }
-      records.push({ id, filePath, parentId: parentThreadIdFromFirstLine(first) });
     });
-  }
-
-  return records;
-}
-
-function indexedLocalSessionRecords(codexHome = CODEX_HOME) {
-  const byId = new Map();
-  for (const record of localSessionFileRecords(codexHome)) {
-    const existing = byId.get(record.id);
-    if (!existing || record.filePath.localeCompare(existing.filePath) > 0) {
-      byId.set(record.id, record);
-    }
-  }
-
-  const byParent = new Map();
-  for (const record of byId.values()) {
-    if (!record.parentId) continue;
-    if (!byParent.has(record.parentId)) byParent.set(record.parentId, []);
-    byParent.get(record.parentId).push(record);
-  }
-  for (const records of byParent.values()) {
-    records.sort((a, b) => a.filePath.localeCompare(b.filePath));
   }
 
   return { byId, byParent };
 }
 
-function spawnedChildIds(session) {
-  return (session?.spawned || [])
-    .filter((entry) => entry?.status === "spawned" && entry.id)
-    .map((entry) => entry.id);
-}
-
-function childRecordsForParent(recordIndex, parentId, spawnedIds) {
-  const byFile = new Map();
+function childRefsFromIndex(index, parentId, spawnedIds = []) {
+  const refs = new Map(index.byParent.get(parentId) || []);
   for (const id of spawnedIds || []) {
-    const record = recordIndex.byId.get(id);
-    if (record) byFile.set(record.filePath, record);
+    const filePath = index.byId.get(id);
+    if (filePath) refs.set(id, filePath);
   }
-  for (const record of recordIndex.byParent.get(parentId) || []) {
-    byFile.set(record.filePath, record);
-  }
-  return [...byFile.values()].sort((a, b) => a.filePath.localeCompare(b.filePath));
-}
-
-function parseLocalDescendantSessions(rootParentId, parent, index, codexHome = CODEX_HOME, options = {}) {
-  const recordIndex = indexedLocalSessionRecords(codexHome);
-  const parsedById = new Map();
-  const seenIds = new Set([rootParentId]);
-  const queue = [
-    {
-      parentId: rootParentId,
-      spawnedIds: spawnedChildIds(parent),
-      depth: 1,
-    },
-  ];
-
-  while (queue.length && parsedById.size < MAX_CHILD_SESSIONS) {
-    const current = queue.shift();
-    if (!current || current.depth > MAX_CHILD_SESSION_DEPTH) continue;
-
-    for (const record of childRecordsForParent(recordIndex, current.parentId, current.spawnedIds)) {
-      if (!record.id || seenIds.has(record.id) || parsedById.size >= MAX_CHILD_SESSIONS) continue;
-      seenIds.add(record.id);
-
-      const parsed = parseSessionFile(record.filePath, index.get(record.id), options);
-      parsed.rootParentId = rootParentId;
-      parsed.parentSessionId = childParentId(parsed) || record.parentId || current.parentId;
-      parsed.childDepth = current.depth;
-      parsedById.set(parsed.id, parsed);
-
-      queue.push({
-        parentId: parsed.id,
-        spawnedIds: spawnedChildIds(parsed),
-        depth: current.depth + 1,
-      });
-    }
-  }
-
-  return parsedChildSessions(rootParentId, [...parsedById.values()]);
+  return [...refs.entries()].map(([id, filePath]) => ({ id, filePath }));
 }
 
 function toMs(timestamp) {
@@ -686,25 +615,8 @@ function formatDurationMs(ms) {
   return parts.join(" ");
 }
 
-function toolArgumentSections(call) {
-  const sections = [];
-  const argsText = safeJson(call.args || {});
-  const pollArgsText = call.terminalPollArgs ? safeJson(call.terminalPollArgs) : "";
-
-  if (pollArgsText && pollArgsText !== "{}") {
-    sections.push(`Terminal poll arguments:\n${pollArgsText}`);
-  }
-  if (argsText && argsText !== "{}") {
-    sections.push(`${call.terminalPollArgs ? "Original command arguments" : "Arguments"}:\n${argsText}`);
-  }
-  return sections;
-}
-
-function toolArgsPreview(call) {
-  return clipSpanDetail(toolArgumentSections(call).join("\n\n") || safeJson(call.args || {}));
-}
-
 function spanDetail(call, type, durationMs, wallMs, exitCode, parsed, output) {
+  const argsText = safeJson(call.args || {});
   const outputSummary = parsedOutputSummary(parsed);
   const outputText = outputPayloadText(output);
   const sections = [
@@ -715,11 +627,10 @@ function spanDetail(call, type, durationMs, wallMs, exitCode, parsed, output) {
   if (call.originalName && call.originalName !== call.name && !call.terminalCommand) {
     sections.push(`Underlying tool: ${call.originalName}`);
   }
-  if (call.terminalPollArgs && call.originalName) sections.push(`Terminal poll tool: ${call.originalName}`);
   if (call.terminalSessionId) sections.push(`Terminal session: ${call.terminalSessionId}`);
   if (exitCode != null) sections.push(`Exit code: ${exitCode}`);
   if (type === "wait") sections.push(`Wait target:\n${waitTargetSummary(call.name, call.args || {})}`);
-  sections.push(...toolArgumentSections(call));
+  if (argsText && argsText !== "{}") sections.push(`Arguments:\n${argsText}`);
   if (outputSummary) sections.push(`Parsed output summary:\n${outputSummary}`);
   if (outputText && !outputSummary) sections.push(`Output:\n${outputText}`);
 
@@ -727,6 +638,7 @@ function spanDetail(call, type, durationMs, wallMs, exitCode, parsed, output) {
 }
 
 function runningSpanDetail(call, type, durationMs) {
+  const argsText = safeJson(call.args || {});
   const sections = [
     `Tool: ${call.name}`,
     "Status: running; no completion record has been written to the transcript yet.",
@@ -737,69 +649,30 @@ function runningSpanDetail(call, type, durationMs) {
   if (call.originalName && call.originalName !== call.name && !call.terminalCommand) {
     sections.push(`Underlying tool: ${call.originalName}`);
   }
-  if (call.terminalPollArgs && call.originalName) sections.push(`Terminal poll tool: ${call.originalName}`);
   if (call.terminalSessionId) sections.push(`Terminal session: ${call.terminalSessionId}`);
   if (type === "wait") sections.push(`Wait target:\n${waitTargetSummary(call.name, call.args || {})}`);
-  sections.push(...toolArgumentSections(call));
+  if (argsText && argsText !== "{}") sections.push(`Arguments:\n${argsText}`);
   return clipSpanDetail(sections.filter(Boolean).join("\n\n"));
 }
 
-function interruptedSpanDetail(call, type, durationMs, reason) {
+function interruptedSpanDetail(call, type, durationMs, boundary) {
+  const argsText = safeJson(call.args || {});
+  const boundaryLabel = boundary?.label || "next transcript boundary";
   const sections = [
     `Tool: ${call.name}`,
-    "Status: no completion record was written before the transcript advanced.",
-    `Duration shown: ${formatDurationMs(durationMs)}`,
-    reason ? `Closed by timeline parser: ${reason}` : "",
+    "Status: interrupted/missing output; no completion record was written to the transcript.",
+    `Visible duration: ${formatDurationMs(durationMs)}`,
+    `Closed at: ${boundaryLabel}${boundary?.ts ? ` (${new Date(boundary.ts).toLocaleString()})` : ""}`,
+    "What this means: the dashboard found later transcript activity, so this tool was no longer blocking the thread. The span is clipped at that boundary instead of stretching to the current wall clock.",
   ];
 
   if (call.originalName && call.originalName !== call.name && !call.terminalCommand) {
     sections.push(`Underlying tool: ${call.originalName}`);
   }
-  if (call.terminalPollArgs && call.originalName) sections.push(`Terminal poll tool: ${call.originalName}`);
   if (call.terminalSessionId) sections.push(`Terminal session: ${call.terminalSessionId}`);
   if (type === "wait") sections.push(`Wait target:\n${waitTargetSummary(call.name, call.args || {})}`);
-  sections.push(...toolArgumentSections(call));
+  if (argsText && argsText !== "{}") sections.push(`Arguments:\n${argsText}`);
   return clipSpanDetail(sections.filter(Boolean).join("\n\n"));
-}
-
-function openToolCallBoundaryReason(row, payloadType, payload) {
-  if (payloadType === "task_started") return "next task started";
-  if (row.type === "turn_context") return "next turn context started";
-  if (payloadType === "user_message") return "next user message";
-  if (payloadType === "turn_aborted") return "turn aborted";
-  if (payloadType === "agent_message" && payload.phase === "final_answer") return "final answer emitted";
-  if (row.type === "event_msg" && payloadType === "task_complete") return "task completed";
-  return "";
-}
-
-function closeInterruptedToolCalls(toolCalls, terminalSessions, spans, endMs, reason, launcherHints) {
-  if (!Number.isFinite(endMs) || !toolCalls.size) return;
-  for (const call of toolCalls.values()) {
-    if (!Number.isFinite(call.start) || call.start > endMs) continue;
-    const displayCall = semanticToolCall(call, terminalSessions);
-    collectLauncherHintsFromCall(displayCall, launcherHints, endMs);
-    const type = toolSpanType(displayCall.name, null);
-    const label = summarizeTool(displayCall.name, displayCall.args);
-    const durationMs = Math.max(1, endMs - call.start);
-    spans.push({
-      id: displayCall.callId,
-      type,
-      status: "interrupted",
-      name: displayCall.name,
-      label,
-      args: displayCall.args || {},
-      start: displayCall.start,
-      end: endMs,
-      durationMs,
-      wallMs: null,
-      exitCode: null,
-      waitTarget: type === "wait" ? waitTargetSummary(displayCall.name, displayCall.args) : "",
-      argsPreview: toolArgsPreview(displayCall),
-      outputPreview: "No completion record before transcript boundary.",
-      detail: interruptedSpanDetail(displayCall, type, durationMs, reason),
-    });
-  }
-  toolCalls.clear();
 }
 
 function markerAttachments(payload) {
@@ -1307,14 +1180,6 @@ function collectLauncherHintsFromCall(call, hints, observedAt) {
   );
 }
 
-function codexSecurityQueueHintsFromLauncherHints(hints) {
-  return mergeCodexSecurityQueueHints(
-    [...(hints?.values?.() || [])]
-      .filter((hint) => hint?.dbPath && hint?.jobId)
-      .map((hint) => ({ dbPath: hint.dbPath, jobIds: [hint.jobId] })),
-  );
-}
-
 function launcherMetadataDirs(rootDir) {
   if (!rootDir || !fs.existsSync(rootDir)) return [];
   const limit = Math.max(1, Number(MAX_LAUNCHER_WORKER_FILES) || 500);
@@ -1450,40 +1315,12 @@ function readOptionalText(filePath, maxChars = 8000) {
   }
 }
 
-function launcherEventRows(filePath, options = {}) {
+function launcherEventRows(filePath) {
   if (!filePath || !fs.existsSync(filePath)) return { rows: [], totalRows: 0, truncated: false };
   const rows = readJsonl(filePath);
-  const allEvents = options.launcherEventsMode === "all";
-  if (allEvents) {
-    return {
-      rows,
-      totalRows: rows.length,
-      retainedRows: rows.length,
-      omittedRows: 0,
-      truncated: false,
-      window: "all",
-    };
-  }
   const limit = Math.max(0, Number(MAX_LAUNCHER_EVENT_ROWS) || 0);
-  if (!limit || rows.length <= limit) {
-    return {
-      rows,
-      totalRows: rows.length,
-      retainedRows: rows.length,
-      omittedRows: 0,
-      truncated: false,
-      window: "all",
-    };
-  }
-  const start = rows.length - limit;
-  return {
-    rows: rows.slice(start),
-    totalRows: rows.length,
-    retainedRows: limit,
-    omittedRows: start,
-    truncated: true,
-    window: "latest",
-  };
+  if (!limit || rows.length <= limit) return { rows, totalRows: rows.length, truncated: false };
+  return { rows: rows.slice(0, limit), totalRows: rows.length, truncated: true };
 }
 
 function launcherToolCallFromItem(item, start) {
@@ -1531,14 +1368,14 @@ function launcherSpanFromCall(call, end, output, parsed = null, wallMs = null, e
     wallMs,
     exitCode,
     waitTarget: type === "wait" ? waitTargetSummary(displayCall.name, displayCall.args) : "",
-    argsPreview: toolArgsPreview(displayCall),
+    argsPreview: clipSpanDetail(safeJson(displayCall.args || {})),
     outputPreview: clipSpanDetail(parsedOutputSummary(parsed) || outputPayloadText(output || "")),
     detail: spanDetail(displayCall, type, durationMs, wallMs, exitCode, parsed, output || ""),
   };
 }
 
-function parseLauncherEvents(filePath, options = {}) {
-  const { rows, totalRows, retainedRows, omittedRows, truncated, window } = launcherEventRows(filePath, options);
+function parseLauncherEvents(filePath) {
+  const { rows, totalRows, truncated } = launcherEventRows(filePath);
   const toolCalls = new Map();
   const itemStarts = new Map();
   const spans = [];
@@ -1683,10 +1520,7 @@ function parseLauncherEvents(filePath, options = {}) {
     start,
     end,
     totalRows,
-    retainedRows,
-    omittedRows,
     truncated,
-    window,
   };
 }
 
@@ -1714,11 +1548,7 @@ function launcherWorkerDetail(record, promptText, eventInfo) {
     launcher.status_file ? `Status file: ${launcher.status_file}` : "",
     launcher.done_file ? `Done file: ${launcher.done_file}` : "",
     launcher.events_file ? `Events file: ${launcher.events_file}` : "",
-    eventInfo?.totalRows != null
-      ? `Launcher event rows: ${eventInfo.retainedRows ?? eventInfo.totalRows}/${eventInfo.totalRows}${
-          eventInfo.truncated ? " (latest rows; older rows omitted)" : ""
-        }`
-      : "",
+    eventInfo?.totalRows != null ? `Launcher event rows: ${eventInfo.totalRows}${eventInfo.truncated ? " (truncated)" : ""}` : "",
     error ? `Error:\n${safeJson(error)}` : "",
     promptText ? `Prompt:\n${promptText}` : "",
   ]
@@ -1726,7 +1556,7 @@ function launcherWorkerDetail(record, promptText, eventInfo) {
     .join("\n\n");
 }
 
-function launcherWorkerSessions(records, parentId, options = {}) {
+function launcherWorkerSessions(records, parentId) {
   const result = [];
   for (let record of records.values()) {
     record = launcherWorkerWithDoneFile(record);
@@ -1734,7 +1564,7 @@ function launcherWorkerSessions(records, parentId, options = {}) {
     const threadId = record.threadId || launcher.thread_id || "";
     const workerId = record.workerId || launcher.worker_id || threadId || "app-server worker";
     const eventsFile = launcher.events_file || "";
-    const eventInfo = parseLauncherEvents(eventsFile, options);
+    const eventInfo = parseLauncherEvents(eventsFile);
     const promptText = readOptionalText(record.promptFile);
     const doneMs = launcherDoneMs(record);
     const markers = [...eventInfo.markers];
@@ -1820,10 +1650,7 @@ function launcherWorkerSessions(records, parentId, options = {}) {
             done_file: launcher.done_file || "",
             prompt: promptText,
             event_rows: eventInfo.totalRows,
-            event_rows_loaded: eventInfo.retainedRows ?? eventInfo.totalRows,
-            event_rows_omitted: eventInfo.omittedRows || 0,
             event_rows_truncated: eventInfo.truncated,
-            event_rows_window: eventInfo.window || "all",
           },
         },
         threadSource: "app_server",
@@ -1891,7 +1718,30 @@ function unionMs(intervals) {
   return total;
 }
 
-function parseSessionRows(rows, filePath, indexEntry, options = {}) {
+function unresolvedCallBoundaryLabel(row) {
+  const payloadType = row?.payload?.type || "";
+  if (payloadType === "message") return "assistant message";
+  if (payloadType === "agent_message") return "assistant message";
+  if (payloadType === "user_message") return "user message";
+  if (payloadType === "task_complete") return "task complete";
+  if (payloadType === "turn_aborted") return "turn aborted";
+  if (payloadType === "task_started") return "next task started";
+  if (payloadType === "context_compacted" || row?.type === "compacted") return "context compaction";
+  if (payloadType === "thread_goal_updated") return "goal update";
+  return "";
+}
+
+function nextUnresolvedCallBoundary(rows, afterMs) {
+  for (const row of rows || []) {
+    const ts = toMs(row.timestamp);
+    if (!Number.isFinite(ts) || ts <= afterMs) continue;
+    const label = unresolvedCallBoundaryLabel(row);
+    if (label) return { ts, label };
+  }
+  return null;
+}
+
+function parseSessionRows(rows, filePath, indexEntry) {
   const toolCalls = new Map();
   const terminalSessions = new Map();
   const spans = [];
@@ -1916,11 +1766,6 @@ function parseSessionRows(rows, filePath, indexEntry, options = {}) {
     const payloadType = payload.type || "";
     const key = [row.type, payloadType, payload.name].filter(Boolean).join("/");
     eventCounts[key] = (eventCounts[key] || 0) + 1;
-
-    const boundaryReason = openToolCallBoundaryReason(row, payloadType, payload);
-    if (boundaryReason) {
-      closeInterruptedToolCalls(toolCalls, terminalSessions, spans, ts, boundaryReason, launcherHints);
-    }
 
     if (row.type === "session_meta" && !meta.id) {
       meta = {
@@ -2001,7 +1846,7 @@ function parseSessionRows(rows, filePath, indexEntry, options = {}) {
         wallMs,
         exitCode,
         waitTarget: type === "wait" ? waitTargetSummary(displayCall.name, displayCall.args) : "",
-        argsPreview: toolArgsPreview(displayCall),
+        argsPreview: clipSpanDetail(safeJson(displayCall.args || {})),
         outputPreview: clipSpanDetail(parsedOutputSummary(parsed) || outputPayloadText(payload.output)),
         detail: spanDetail(displayCall, type, durationMs, wallMs, exitCode, parsed, payload.output),
       });
@@ -2080,16 +1925,18 @@ function parseSessionRows(rows, filePath, indexEntry, options = {}) {
   for (const call of toolCalls.values()) {
     if (!Number.isFinite(call.start) || call.start > activeEnd) continue;
     const displayCall = semanticToolCall(call, terminalSessions);
-    collectLauncherHintsFromCall(displayCall, launcherHints, activeEnd);
+    const boundary = nextUnresolvedCallBoundary(rows, call.start);
+    const endMs = boundary?.ts || activeEnd;
+    collectLauncherHintsFromCall(displayCall, launcherHints, endMs);
     const type = toolSpanType(displayCall.name, null);
     const label = summarizeTool(displayCall.name, displayCall.args);
-    const durationMs = Math.max(1, activeEnd - call.start);
-    const endMs = call.start + durationMs;
+    const durationMs = Math.max(1, endMs - call.start);
+    const isStillRunning = !boundary;
     spans.push({
       id: displayCall.callId,
       type,
-      status: "running",
-      active: true,
+      status: isStillRunning ? "running" : "interrupted",
+      active: isStillRunning,
       name: displayCall.name,
       label,
       args: displayCall.args || {},
@@ -2099,9 +1946,11 @@ function parseSessionRows(rows, filePath, indexEntry, options = {}) {
       wallMs: null,
       exitCode: null,
       waitTarget: type === "wait" ? waitTargetSummary(displayCall.name, displayCall.args) : "",
-      argsPreview: toolArgsPreview(displayCall),
+      argsPreview: clipSpanDetail(safeJson(displayCall.args || {})),
       outputPreview: "",
-      detail: runningSpanDetail(displayCall, type, durationMs),
+      detail: isStillRunning
+        ? runningSpanDetail(displayCall, type, durationMs)
+        : interruptedSpanDetail(displayCall, type, durationMs, boundary),
     });
     end = end == null ? endMs : Math.max(end, endMs);
   }
@@ -2112,7 +1961,6 @@ function parseSessionRows(rows, filePath, indexEntry, options = {}) {
   const busyMs = unionMs(spans);
   const quietMs = Math.max(0, activeSpanMs - busyMs);
   collectLauncherWorkersFromHints(launcherHints, launcherWorkers);
-  const codexSecurityQueueHints = codexSecurityQueueHintsFromLauncherHints(launcherHints);
 
   return {
     id: meta.id || indexEntry?.id || path.basename(filePath),
@@ -2136,16 +1984,15 @@ function parseSessionRows(rows, filePath, indexEntry, options = {}) {
     markers: normalizedMarkers(markers.filter((m) => m.ts)),
     spawned,
     namespaces: [...namespaces],
-    codexSecurityQueueHints,
-    appThreads: mergedAppThreadSessions([
+    appThreads: [
       ...appThreadSessions(appThreads, meta.id || indexEntry?.id || path.basename(filePath)),
-      ...launcherWorkerSessions(launcherWorkers, meta.id || indexEntry?.id || path.basename(filePath), options),
-    ]),
+      ...launcherWorkerSessions(launcherWorkers, meta.id || indexEntry?.id || path.basename(filePath)),
+    ],
   };
 }
 
-function parseSessionFile(filePath, indexEntry, options = {}) {
-  return parseSessionRows(readJsonl(filePath), filePath, indexEntry, options);
+function parseSessionFile(filePath, indexEntry) {
+  return parseSessionRows(readJsonl(filePath), filePath, indexEntry);
 }
 
 function collectNamespaces(value, result = new Set()) {
@@ -2563,299 +2410,6 @@ function codexSecurityQueueHintsFromAppThreads(appThreads) {
   return [...byDb.entries()].map(([dbPath, jobIds]) => ({ dbPath, jobIds: [...jobIds] }));
 }
 
-function likelyCodexSecurityQueueDb(fileName) {
-  return fileName === "queue.db" || /queue.*\.db$/i.test(fileName);
-}
-
-function shouldSkipQueueDbDir(dirName) {
-  return [
-    ".git",
-    "node_modules",
-    "target",
-    "cargo-target",
-    "validation-artifacts",
-  ].includes(dirName);
-}
-
-function walkQueueDbs(rootDir, visitor) {
-  if (!rootDir || !fs.existsSync(rootDir)) return;
-  const stack = [rootDir];
-  let visited = 0;
-  while (stack.length && visited < 5000) {
-    const current = stack.pop();
-    visited += 1;
-    let entries = [];
-    try {
-      entries = fs.readdirSync(current, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-    for (const entry of entries) {
-      const fullPath = path.join(current, entry.name);
-      if (entry.isDirectory()) {
-        if (!shouldSkipQueueDbDir(entry.name)) stack.push(fullPath);
-      } else if (entry.isFile() && likelyCodexSecurityQueueDb(entry.name)) {
-        visitor(fullPath);
-      }
-    }
-  }
-}
-
-function codexSecurityQueueDbRoots(codexHome = CODEX_HOME) {
-  return [
-    path.join(os.homedir(), ".cache", "codex-security"),
-    path.join(codexHome || CODEX_HOME, "state", "plugins", "codex-security"),
-  ];
-}
-
-function discoverCodexSecurityQueueDbs(codexHome = CODEX_HOME) {
-  const paths = new Set();
-  for (const root of codexSecurityQueueDbRoots(codexHome)) {
-    walkQueueDbs(root, (dbPath) => paths.add(dbPath));
-  }
-  return [...paths].sort();
-}
-
-function codexSecurityQueueHintsFromParentThread(sessionId, codexHome = CODEX_HOME) {
-  const byDb = new Map();
-  for (const dbPath of discoverCodexSecurityQueueDbs(codexHome)) {
-    try {
-      const tables = sqliteJson(
-        dbPath,
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('jobs', 'work_items')",
-      );
-      if (tables.length < 2) continue;
-      const jobs = sqliteJson(
-        dbPath,
-        `SELECT id FROM jobs WHERE parent_thread_id = '${sqlEscape(sessionId)}' ORDER BY updated_at DESC`,
-      );
-      const jobIds = jobs.map((job) => job.id).filter(Boolean);
-      if (!jobIds.length) continue;
-      if (!byDb.has(dbPath)) byDb.set(dbPath, new Set());
-      for (const jobId of jobIds) byDb.get(dbPath).add(jobId);
-    } catch {
-      // Ignore non-matching or transiently locked queue DBs.
-    }
-  }
-  return [...byDb.entries()].map(([dbPath, jobIds]) => ({ dbPath, jobIds: [...jobIds] }));
-}
-
-function mergeCodexSecurityQueueHints(hints) {
-  const byDb = new Map();
-  for (const hint of hints || []) {
-    const dbPath = canonicalDbPath(hint?.dbPath || "");
-    if (!dbPath) continue;
-    if (!byDb.has(dbPath)) byDb.set(dbPath, new Set());
-    for (const jobId of hint.jobIds || []) {
-      if (jobId) byDb.get(dbPath).add(jobId);
-    }
-  }
-  return [...byDb.entries()].map(([dbPath, jobIds]) => ({ dbPath, jobIds: [...jobIds] }));
-}
-
-function canonicalDbPath(dbPath) {
-  if (!dbPath) return "";
-  const resolved = path.resolve(String(dbPath));
-  try {
-    return fs.realpathSync.native(resolved);
-  } catch {
-    return resolved;
-  }
-}
-
-function codexSecurityScanKeyFromDbPath(dbPath) {
-  const parts = String(dbPath || "").split(path.sep).filter(Boolean);
-  const queueRootIndex = parts.findIndex((part) => /-queues$/i.test(part));
-  if (queueRootIndex >= 0 && parts[queueRootIndex + 1] && parts[queueRootIndex + 2]) {
-    return `${parts[queueRootIndex + 1]}/${parts[queueRootIndex + 2]}`;
-  }
-
-  const scansIndex = parts.lastIndexOf("scans");
-  if (scansIndex >= 0 && parts[scansIndex + 1] && parts[scansIndex + 2]) {
-    return `${parts[scansIndex + 1]}/${String(parts[scansIndex + 2]).split("_")[0]}`;
-  }
-
-  return "";
-}
-
-function isoFromAppTimestamp(value) {
-  const ms = appTimestampMs(value);
-  return ms ? new Date(ms).toISOString() : "";
-}
-
-function codexSecurityJobHeartbeatStale(job, now = Date.now()) {
-  const status = String(job?.status || "");
-  if (status !== "running" && status !== "pending") return false;
-  const heartbeatMs = appTimestampMs(job?.parent_heartbeat_at);
-  const staleSeconds = Number(job?.parent_stale_seconds || 0);
-  return Boolean(heartbeatMs && staleSeconds > 0 && now - heartbeatMs > staleSeconds * 1000);
-}
-
-function codexSecurityQueueLinkStatus(job, sessionId) {
-  const parentThreadId = job?.parent_thread_id || "";
-  if (sessionId && parentThreadId === sessionId) return "linked";
-  if (!parentThreadId) return "unlinked";
-  return "other-session";
-}
-
-function codexSecurityQueueSummary(job, countRows, workerRows, dbPath, sessionId, extra = {}) {
-  const counts = queueCountsFor(countRows, job.id, job.id);
-  const now = Date.now();
-  const linkStatus = codexSecurityQueueLinkStatus(job, sessionId);
-  return {
-    namespace: job.id,
-    name: job.id,
-    description: job.name || "Codex Security queue job",
-    instructions: job.name || "",
-    createdAt: isoFromAppTimestamp(job.created_at),
-    updatedAt: isoFromAppTimestamp(job.updated_at),
-    lastActivityAt: isoFromAppTimestamp(job.updated_at),
-    lastEnqueuedAt: "",
-    lastClaimedAt: "",
-    lastCompletedAt: isoFromAppTimestamp(job.completed_at),
-    status: job.status || "",
-    counts,
-    sampleRowsLoaded: extra.sampleRowsLoaded || 0,
-    source: "codex-security",
-    dbPath,
-    workerCount: workerRows.filter((worker) => worker.job_id === job.id).length,
-    parentThreadId: job.parent_thread_id || "",
-    linkedToSession: linkStatus === "linked",
-    linkStatus,
-    parentHeartbeatAt: isoFromAppTimestamp(job.parent_heartbeat_at),
-    parentStaleSeconds: Number(job.parent_stale_seconds || 0),
-    heartbeatStale: codexSecurityJobHeartbeatStale(job, now),
-    detached: Boolean(Number(job.detached || 0)),
-    diagnosticReason: extra.diagnosticReason || "",
-  };
-}
-
-function launcherWorkerRecordsFromWorkerRows(workerRows) {
-  const records = new Map();
-  for (const row of workerRows || []) {
-    let metadata = {};
-    try {
-      metadata = row.metadata_json ? JSON.parse(row.metadata_json) : {};
-    } catch {
-      metadata = {};
-    }
-    mergeLauncherWorkerRecord(
-      records,
-      {
-        worker_id: row.worker_id || "",
-        thread_id: row.thread_id || "",
-        job_id: row.job_id || "",
-        status: row.status || "",
-        created_at: row.created_at,
-        updated_at: row.updated_at || row.last_queue_action_at || row.last_observed_at,
-        last_observed_at: row.last_observed_at,
-        last_queue_action_at: row.last_queue_action_at,
-        last_error: row.last_error || "",
-        metadata,
-      },
-      appTimestampMs(row.updated_at || row.last_queue_action_at || row.last_observed_at || row.created_at),
-    );
-  }
-  return records;
-}
-
-function codexSecurityActiveDiagnosticQueuesFromDb(dbPath, sessionId, linkedJobKeys) {
-  const warnings = [];
-  let jobs = [];
-  let countRows = [];
-  let workerRows = [];
-  try {
-    const tables = sqliteJson(
-      dbPath,
-      "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('jobs', 'work_items')",
-    );
-    if (tables.length < 2) return { queues: [], warnings };
-    jobs = sqliteJson(
-      dbPath,
-      `SELECT id, name, status, input_path, output_path, max_attempts, lease_ttl_seconds,
-              created_at, updated_at, completed_at, last_error, no_new_leases,
-              cancel_requested_at, cancel_reason, parent_heartbeat_at, parent_thread_id,
-              parent_stale_seconds, detached
-       FROM jobs ORDER BY updated_at DESC`,
-    );
-    if (!jobs.length) return { queues: [], warnings };
-    const jobFilter = jobs.map((job) => `'${sqlEscape(job.id)}'`).join(",");
-    countRows = sqliteJson(
-      dbPath,
-      `SELECT job_id AS namespace, job_id AS queue_name,
-              CASE status WHEN 'pending' THEN 'queued' ELSE status END AS status,
-              COUNT(*) AS count
-       FROM work_items
-       WHERE job_id IN (${jobFilter})
-       GROUP BY job_id, status`,
-    );
-    workerRows = sqliteJson(
-      dbPath,
-      `SELECT job_id, worker_id, thread_id, status, metadata_json, created_at, updated_at,
-              last_observed_at, last_queue_action_at, last_error
-       FROM worker_runs
-       WHERE job_id IN (${jobFilter})
-       ORDER BY job_id, worker_id`,
-    );
-  } catch (err) {
-    warnings.push(err.message);
-    return { queues: [], warnings };
-  }
-
-  const queues = [];
-  for (const job of jobs) {
-    const linkedKey = `${dbPath}\0${job.id}`;
-    if (linkedJobKeys.has(linkedKey)) continue;
-    if (sessionId && job.parent_thread_id === sessionId) continue;
-
-    const counts = queueCountsFor(countRows, job.id, job.id);
-    const activeItems = Number(counts.queued || 0) + Number(counts.leased || 0);
-    const stale = codexSecurityJobHeartbeatStale(job);
-    const jobActive = job.status === "running" || job.status === "pending";
-    if (!activeItems && !jobActive && !stale) continue;
-
-    queues.push(
-      codexSecurityQueueSummary(job, countRows, workerRows, dbPath, sessionId, {
-        diagnosticReason: stale
-          ? "Unlinked stale/running queue in this scan root"
-          : "Unlinked active queue in this scan root",
-      }),
-    );
-  }
-  return { queues, warnings };
-}
-
-function discoverRelatedCodexSecurityDiagnostics(sessionId, hints, codexHome = CODEX_HOME) {
-  const scanKeys = new Set((hints || []).map((hint) => codexSecurityScanKeyFromDbPath(hint.dbPath)).filter(Boolean));
-  if (!scanKeys.size) return { queues: [], warnings: [] };
-
-  const linkedJobKeys = new Set();
-  for (const hint of hints || []) {
-    for (const jobId of hint.jobIds || []) {
-      linkedJobKeys.add(`${hint.dbPath}\0${jobId}`);
-    }
-  }
-
-  const queues = [];
-  const warnings = [];
-  for (const dbPath of discoverCodexSecurityQueueDbs(codexHome)) {
-    if (!scanKeys.has(codexSecurityScanKeyFromDbPath(dbPath))) continue;
-    const result = codexSecurityActiveDiagnosticQueuesFromDb(dbPath, sessionId, linkedJobKeys);
-    queues.push(...result.queues);
-    warnings.push(...result.warnings);
-  }
-
-  return {
-    queues: queues.sort((a, b) => {
-      const activeA = Number(a.counts?.queued || 0) + Number(a.counts?.leased || 0);
-      const activeB = Number(b.counts?.queued || 0) + Number(b.counts?.leased || 0);
-      if (activeA !== activeB) return activeB - activeA;
-      return String(b.updatedAt || "").localeCompare(String(a.updatedAt || ""));
-    }),
-    warnings,
-  };
-}
-
 function codexSecurityItemRows(dbPath, jobFilter) {
   const baseColumns = `SELECT id, job_id, item_key, input_json, status, attempt_count,
               lease_id, worker_id, lease_expires_at, result_json, last_error,
@@ -2875,7 +2429,7 @@ function codexSecurityItemRows(dbPath, jobFilter) {
   ).slice(0, MAX_QUEUE_ITEMS);
 }
 
-function loadCodexSecurityQueueDataFromDb(dbPath, jobIds, options = {}) {
+function loadCodexSecurityQueueDataFromDb(dbPath, jobIds) {
   const warnings = [];
   if (!fs.existsSync(dbPath)) {
     return emptyQueue(dbPath, [`Codex Security queue DB not found at ${dbPath}`]);
@@ -2894,8 +2448,7 @@ function loadCodexSecurityQueueDataFromDb(dbPath, jobIds, options = {}) {
       dbPath,
       `SELECT id, name, status, input_path, output_path, max_attempts, lease_ttl_seconds,
               created_at, updated_at, completed_at, last_error, no_new_leases,
-              cancel_requested_at, cancel_reason, parent_heartbeat_at, parent_thread_id,
-              parent_stale_seconds, detached
+              cancel_requested_at, cancel_reason, parent_heartbeat_at, parent_thread_id
        FROM jobs ${jobWhere} ORDER BY updated_at DESC`,
     );
     if (!jobs.length) {
@@ -2923,7 +2476,7 @@ function loadCodexSecurityQueueDataFromDb(dbPath, jobIds, options = {}) {
     );
     workerRows = sqliteJson(
       dbPath,
-      `SELECT job_id, worker_id, thread_id, status, metadata_json, created_at, updated_at,
+      `SELECT job_id, worker_id, thread_id, status, created_at, updated_at,
               last_observed_at, last_queue_action_at, last_error
        FROM worker_runs
        WHERE job_id IN (${jobFilter})
@@ -3007,9 +2560,25 @@ function loadCodexSecurityQueueDataFromDb(dbPath, jobIds, options = {}) {
 
   const normalizedQueues = (jobs || []).map((job) => {
     const queueItems = normalizedItems.filter((item) => item.queueName === job.id);
-    return codexSecurityQueueSummary(job, countRows, workerRows, dbPath, options.sessionId || "", {
+    const counts = queueCountsFor(countRows, job.id, job.id);
+    return {
+      namespace: job.id,
+      name: job.id,
+      description: job.name || "Codex Security queue job",
+      instructions: job.name || "",
+      createdAt: job.created_at ? new Date(appTimestampMs(job.created_at)).toISOString() : "",
+      updatedAt: job.updated_at ? new Date(appTimestampMs(job.updated_at)).toISOString() : "",
+      lastActivityAt: job.updated_at ? new Date(appTimestampMs(job.updated_at)).toISOString() : "",
+      lastEnqueuedAt: "",
+      lastClaimedAt: "",
+      lastCompletedAt: job.completed_at ? new Date(appTimestampMs(job.completed_at)).toISOString() : "",
+      status: job.status || "",
+      counts,
       sampleRowsLoaded: queueItems.length,
-    });
+      source: "codex-security",
+      dbPath,
+      workerCount: workerRows.filter((worker) => worker.job_id === job.id).length,
+    };
   });
   const queueTimeline = buildQueueTimeline(timelineItems, normalizedQueues);
 
@@ -3019,11 +2588,6 @@ function loadCodexSecurityQueueDataFromDb(dbPath, jobIds, options = {}) {
     namespaces: [],
     queues: normalizedQueues,
     workers: queueWorkerSessions(normalizedItems, normalizedQueues),
-    appWorkers: launcherWorkerSessions(
-      launcherWorkerRecordsFromWorkerRows(workerRows),
-      options.sessionId || "",
-      options,
-    ),
     timeline: queueTimeline,
     items: normalizedItems,
     stats,
@@ -3065,11 +2629,9 @@ function mergeQueueData(parts) {
     dbPaths,
     namespaces: filtered.flatMap((part) => part.namespaces || []),
     queues,
-    appWorkers: mergedAppThreadSessions(filtered.flatMap((part) => part.appWorkers || [])),
     workers: queueWorkerSessions(items, queues),
     timeline,
     items,
-    unlinkedQueues: filtered.flatMap((part) => part.unlinkedQueues || []),
     stats: mergeQueueStats(filtered.map((part) => part.stats)),
     warnings: filtered.flatMap((part) => part.warnings || []),
     truncated: filtered.some((part) => part.truncated),
@@ -3318,21 +2880,12 @@ function loadQueueDataFromDb(dbPath, sessionId, namespaceHints) {
   };
 }
 
-function loadQueueData(sessionId, namespaceHints, appThreads = [], codexHome = CODEX_HOME, options = {}) {
+function loadQueueData(sessionId, namespaceHints, appThreads = []) {
   const queueService = loadQueueDataFromDb(QUEUE_DB, sessionId, namespaceHints);
-  const codexSecurityHints = mergeCodexSecurityQueueHints([
-    ...(Array.isArray(options.codexSecurityQueueHints) ? options.codexSecurityQueueHints : []),
-    ...codexSecurityQueueHintsFromAppThreads(appThreads),
-    ...codexSecurityQueueHintsFromParentThread(sessionId, codexHome),
-  ]);
-  const codexSecurityQueues = codexSecurityHints.map((hint) =>
-    loadCodexSecurityQueueDataFromDb(hint.dbPath, hint.jobIds, { ...options, sessionId }),
+  const codexSecurityQueues = codexSecurityQueueHintsFromAppThreads(appThreads).map((hint) =>
+    loadCodexSecurityQueueDataFromDb(hint.dbPath, hint.jobIds),
   );
-  const queue = mergeQueueData([queueService, ...codexSecurityQueues]);
-  const diagnostics = discoverRelatedCodexSecurityDiagnostics(sessionId, codexSecurityHints, codexHome);
-  queue.unlinkedQueues = diagnostics.queues;
-  queue.warnings = [...(queue.warnings || []), ...diagnostics.warnings];
-  return queue;
+  return mergeQueueData([queueService, ...codexSecurityQueues]);
 }
 
 function emptyQueue(dbPath, warnings = []) {
@@ -3343,7 +2896,6 @@ function emptyQueue(dbPath, warnings = []) {
     workers: [],
     timeline: [],
     items: [],
-    unlinkedQueues: [],
     stats: emptyQueueStats(),
     warnings,
     truncated: false,
@@ -3389,7 +2941,7 @@ function syncRemoteQueueDb(remoteName, host) {
   }
 }
 
-function loadRemoteQueueData(sessionId, namespaceHints, remoteName, host, options = {}) {
+function loadRemoteQueueData(sessionId, namespaceHints, remoteName, host) {
   const { dbPath, synced, warning } = syncRemoteQueueDb(remoteName, host);
   if (!synced) return emptyQueue(dbPath, warning ? [warning] : []);
   const queue = loadQueueDataFromDb(dbPath, sessionId, namespaceHints);
@@ -3622,12 +3174,10 @@ function childLastEventSummary(child) {
   return "no transcript event beyond session metadata";
 }
 
-function agentJobGroups(children, callStart, inputValues, parentId = "") {
+function agentJobGroups(children, callStart, inputValues) {
   const inputSet = new Set(inputValues || []);
   const groups = new Map();
   for (const child of children || []) {
-    const actualParentId = childParentId(child) || child.parentSessionId || "";
-    if (parentId && actualParentId && actualParentId !== parentId) continue;
     const jobId = agentJobIdForSession(child);
     if (!jobId) continue;
     const itemId = agentJobItemId(child);
@@ -3709,7 +3259,7 @@ function spawnAgentsCsvDiagnostics(span, parent, children, source) {
   const args = span.args || safeParseJson(span.argsPreview || "{}", {});
   const input = csvInfo(source, args.csv_path, args.id_column);
   const output = csvInfo(source, args.output_csv_path, "");
-  const groups = agentJobGroups(children, span.start, input.values, parent.id);
+  const groups = agentJobGroups(children, span.start, input.values);
   const group = chooseAgentJobGroup(groups);
   const lines = ["spawn_agents_on_csv diagnostics"];
 
@@ -3761,30 +3311,24 @@ function spawnAgentsCsvDiagnostics(span, parent, children, source) {
 }
 
 function augmentRunningToolDiagnostics(parent, children, source) {
-  for (const session of [parent, ...(children || [])]) {
-    for (const span of session.spans || []) {
-      if (!(span.active || span.status === "running")) continue;
-      const diagnostics = spawnAgentsCsvDiagnostics(span, session, children, source);
-      if (diagnostics) {
-        span.detail = clipSpanDetail([span.detail, diagnostics].filter(Boolean).join("\n\n"));
-      }
+  for (const span of parent.spans || []) {
+    if (!(span.active || span.status === "running" || span.status === "interrupted")) continue;
+    const diagnostics = spawnAgentsCsvDiagnostics(span, parent, children, source);
+    if (diagnostics) {
+      span.detail = clipSpanDetail([span.detail, diagnostics].filter(Boolean).join("\n\n"));
     }
   }
 }
 
 function completeSessionPayload({ codexHome, source, parent, children, queue }) {
-  const queueForPayload = { ...queue };
-  const appThreads = mergedAppThreadSessions([
-    ...(parent.appThreads || []),
-    ...(queueForPayload.appWorkers || []),
-  ]);
-  delete queueForPayload.appWorkers;
-  const queueWorkers = queueForPayload.workers || [];
-  const parentSession = { ...parent };
-  delete parentSession.appThreads;
+  const appThreads = parent.appThreads || [];
+  const queueWorkers = queue.workers || [];
   augmentRunningToolDiagnostics(parent, children, source);
-  const domain = domainFor(parent, children, queueForPayload, appThreads, queueWorkers);
-  const warnings = [...(queueForPayload.warnings || [])];
+  for (const child of children) {
+    augmentRunningToolDiagnostics(child, children, source);
+  }
+  const domain = domainFor(parent, children, queue, appThreads, queueWorkers);
+  const warnings = [...(queue.warnings || [])];
   const spawnedIds = new Set(parent.spawned.filter((s) => s.status === "spawned").map((s) => s.id));
   const parsedChildIds = new Set(children.map((c) => c.id));
   for (const id of spawnedIds) {
@@ -3798,132 +3342,13 @@ function completeSessionPayload({ codexHome, source, parent, children, queue }) 
     generatedAt: new Date().toISOString(),
     source,
     codexHome,
-    session: parentSession,
+    session: parent,
     subagents: children,
     appThreads,
     queueWorkers,
-    queue: queueForPayload,
+    queue,
     domain,
     warnings,
-  };
-}
-
-function compactDetailText(value, max, kind) {
-  const text = String(value || "");
-  if (!text || text.length <= max) return text;
-  const omitted = text.length - max;
-  return `${text.slice(0, max)}\n\n... truncated ${omitted} chars. Use "Load all details" to fetch the full ${kind}.`;
-}
-
-function compactAppServerSource(source) {
-  const compact = { ...source };
-  if (compact.prompt) {
-    compact.prompt = compactDetailText(compact.prompt, COMPACT_PREVIEW_CHARS, "worker prompt");
-  }
-  return compact;
-}
-
-function compactQueueWorkerSource(source) {
-  const compact = { ...source };
-  if (Array.isArray(compact.item_samples)) {
-    compact.item_samples = compact.item_samples.slice(0, 2).map((item) => ({
-      ...item,
-      payloadPreview: compactDetailText(item.payloadPreview, COMPACT_PREVIEW_CHARS, "queue item payload"),
-      resultPreview: compactDetailText(item.resultPreview, COMPACT_PREVIEW_CHARS, "queue item result"),
-    }));
-    compact.item_samples_truncated = source.item_samples.length > compact.item_samples.length;
-  }
-  return compact;
-}
-
-function compactSessionMeta(meta) {
-  if (!meta || typeof meta !== "object") return meta;
-  const compact = { ...meta };
-  if (meta.source && typeof meta.source === "object") {
-    compact.source = { ...meta.source };
-    if (meta.source.app_server) {
-      compact.source.app_server = compactAppServerSource(meta.source.app_server);
-    }
-    if (meta.source.queue_worker) {
-      compact.source.queue_worker = compactQueueWorkerSource(meta.source.queue_worker);
-    }
-  }
-  return compact;
-}
-
-function compactSpan(span) {
-  const compact = {
-    id: span.id,
-    type: span.type,
-    status: span.status,
-    name: span.name,
-    label: span.label,
-    start: span.start,
-    end: span.end,
-    durationMs: span.durationMs,
-    wallMs: span.wallMs,
-    exitCode: span.exitCode,
-    active: span.active,
-  };
-  const running = span.active || span.status === "running";
-  compact.waitTarget = running ? compactDetailText(span.waitTarget, 240, "wait target") : "";
-  compact.argsPreview = "";
-  compact.outputPreview = running ? compactDetailText(span.outputPreview, 240, "tool output") : "";
-  compact.detail = running
-    ? compactDetailText(span.detail, 500, "tool detail")
-    : "Compact timeline mode. Use \"Load all details\" to fetch full tool arguments and output.";
-  return compact;
-}
-
-function compactMarker(marker) {
-  return {
-    type: marker.type,
-    ts: marker.ts,
-    label: marker.label,
-    payloadType: marker.payloadType,
-    detail: compactDetailText(marker.detail, COMPACT_MARKER_DETAIL_CHARS, "event detail"),
-  };
-}
-
-function compactSession(session) {
-  if (!session || typeof session !== "object") return session;
-  return {
-    ...session,
-    meta: compactSessionMeta(session.meta),
-    spans: (session.spans || []).map(compactSpan),
-    markers: (session.markers || []).map(compactMarker),
-  };
-}
-
-function compactQueueItem(item) {
-  return {
-    ...item,
-    payloadPreview: compactDetailText(item.payloadPreview, COMPACT_PREVIEW_CHARS, "queue item payload"),
-    resultPreview: compactDetailText(item.resultPreview, COMPACT_PREVIEW_CHARS, "queue item result"),
-  };
-}
-
-function compactQueue(queue) {
-  if (!queue || typeof queue !== "object") return queue;
-  return {
-    ...queue,
-    items: (queue.items || []).map(compactQueueItem),
-    workers: (queue.workers || []).map(compactSession),
-  };
-}
-
-function compactSessionPayload(payload) {
-  if (!payload?.ok) return payload;
-  const queue = compactQueue(payload.queue);
-  return {
-    ...payload,
-    detailMode: "compact",
-    detailsComplete: false,
-    session: compactSession(payload.session),
-    subagents: (payload.subagents || []).map(compactSession),
-    appThreads: (payload.appThreads || []).map(compactSession),
-    queueWorkers: (payload.queueWorkers || queue?.workers || []).map(compactSession),
-    queue,
   };
 }
 
@@ -3937,7 +3362,7 @@ function childParentId(session) {
 
 function isParsedChildSession(parentId, session) {
   if (!session || session.id === parentId) return false;
-  return childParentId(session) === parentId || session.rootParentId === parentId;
+  return childParentId(session) === parentId;
 }
 
 function parsedChildSessions(parentId, sessions) {
@@ -3952,29 +3377,76 @@ function parsedChildSessions(parentId, sessions) {
   return [...byId.values()].sort((a, b) => clampNumber(a.start) - clampNumber(b.start));
 }
 
-function appThreadDetailScore(session) {
-  const appSource = session?.meta?.source?.app_server || {};
-  return (
-    clampNumber(session?.metrics?.spanCount) * 4 +
-    clampNumber(session?.metrics?.eventCount) +
-    clampNumber(appSource.event_rows) +
-    (session?.meta?.originator === "app_server_launcher" ? 1000 : 0)
-  );
+function relationshipLabel(session) {
+  const nickname = session?.meta?.agentNickname || "";
+  if (nickname) return nickname;
+  return session?.title || session?.id?.slice(0, 8) || "session";
 }
 
-function mergedAppThreadSessions(sessions) {
-  const byId = new Map();
-  for (const session of sessions || []) {
-    if (!session?.id) continue;
-    const existing = byId.get(session.id);
-    if (!existing || appThreadDetailScore(session) > appThreadDetailScore(existing)) {
-      byId.set(session.id, session);
+function setChildRelationship(child, parent, depth) {
+  child.parentSessionId = parent.id;
+  child.parentSessionLabel = relationshipLabel(parent);
+  child.depth = depth;
+  return child;
+}
+
+function collectLocalDescendantSessions(root, index, sessionIndex) {
+  const descendants = [];
+  const seen = new Set([root.id]);
+  const queue = [{ session: root, depth: 0 }];
+
+  while (queue.length) {
+    const { session, depth } = queue.shift();
+    const refs = childRefsFromIndex(
+      index,
+      session.id,
+      session.spawned.filter((s) => s.status === "spawned").map((s) => s.id),
+    );
+
+    for (const ref of refs) {
+      if (seen.has(ref.id)) continue;
+      const parsed = parseSessionFile(ref.filePath, sessionIndex.get(ref.id));
+      if (!isParsedChildSession(session.id, parsed)) continue;
+      seen.add(parsed.id);
+      setChildRelationship(parsed, session, depth + 1);
+      descendants.push(parsed);
+      queue.push({ session: parsed, depth: depth + 1 });
     }
   }
-  return [...byId.values()].sort((a, b) => clampNumber(a.start) - clampNumber(b.start));
+
+  return descendants.sort((a, b) => clampNumber(a.start) - clampNumber(b.start));
 }
 
-function buildLocalSessionPayload(sessionId, codexHome = CODEX_HOME, options = {}) {
+function collectRemoteDescendantSessions(root, host, sessionIndex, rootFileRefs) {
+  const descendants = [];
+  const seen = new Set([root.id]);
+  const queue = [{ session: root, depth: 0, refs: rootFileRefs || null }];
+
+  while (queue.length) {
+    const { session, depth, refs } = queue.shift();
+    const childRefs =
+      refs ||
+      findRemoteChildSessionFiles(
+        host,
+        session.id,
+        session.spawned.filter((s) => s.status === "spawned").map((s) => s.id),
+      );
+
+    for (const ref of childRefs) {
+      if (seen.has(ref.id)) continue;
+      const parsed = parseSessionRows(readRemoteJsonl(host, ref.filePath), ref.filePath, sessionIndex.get(ref.id));
+      if (!isParsedChildSession(session.id, parsed)) continue;
+      seen.add(parsed.id);
+      setChildRelationship(parsed, session, depth + 1);
+      descendants.push(parsed);
+      queue.push({ session: parsed, depth: depth + 1, refs: null });
+    }
+  }
+
+  return descendants.sort((a, b) => clampNumber(a.start) - clampNumber(b.start));
+}
+
+function buildLocalSessionPayload(sessionId, codexHome = CODEX_HOME) {
   const index = loadSessionIndex(codexHome);
   const sessionFile = resolveSessionFile(sessionId, codexHome);
   if (!sessionFile) {
@@ -3988,15 +3460,14 @@ function buildLocalSessionPayload(sessionId, codexHome = CODEX_HOME, options = {
     };
   }
 
-  const parent = parseSessionFile(sessionFile, index.get(sessionId), options);
-  const children = parseLocalDescendantSessions(sessionId, parent, index, codexHome, options);
+  const parent = parseSessionFile(sessionFile, index.get(sessionId));
+  const fileIndex = indexLocalSessionFiles(codexHome);
+  const children = collectLocalDescendantSessions(parent, fileIndex, index);
 
   const queue = loadQueueData(
     sessionId,
     namespaceHintsFor(parent, children, parent.appThreads || []),
     parent.appThreads || [],
-    codexHome,
-    { ...options, codexSecurityQueueHints: parent.codexSecurityQueueHints || [] },
   );
   return completeSessionPayload({
     codexHome,
@@ -4007,7 +3478,7 @@ function buildLocalSessionPayload(sessionId, codexHome = CODEX_HOME, options = {
   });
 }
 
-function buildRemoteSessionPayload(sessionId, remoteName, host, options = {}) {
+function buildRemoteSessionPayload(sessionId, remoteName, host) {
   const index = loadRemoteSessionIndex(host);
   const sessionFile = resolveRemoteSessionFile(host, sessionId);
   if (!sessionFile) {
@@ -4021,20 +3492,15 @@ function buildRemoteSessionPayload(sessionId, remoteName, host, options = {}) {
     };
   }
 
-  const parent = parseSessionRows(readRemoteJsonl(host, sessionFile), `${remoteName}:${sessionFile}`, index.get(sessionId), options);
+  const parent = parseSessionRows(readRemoteJsonl(host, sessionFile), `${remoteName}:${sessionFile}`, index.get(sessionId));
   const childRefs = findRemoteChildSessionFiles(
     host,
     sessionId,
     parent.spawned.filter((s) => s.status === "spawned").map((s) => s.id),
   );
-  const children = parsedChildSessions(
-    sessionId,
-    childRefs.map((child) =>
-      parseSessionRows(readRemoteJsonl(host, child.filePath), `${remoteName}:${child.filePath}`, index.get(child.id), options),
-    ),
-  );
+  const children = collectRemoteDescendantSessions(parent, host, index, childRefs);
 
-  const queue = loadRemoteQueueData(sessionId, namespaceHintsFor(parent, children, parent.appThreads || []), remoteName, host, options);
+  const queue = loadRemoteQueueData(sessionId, namespaceHintsFor(parent, children, parent.appThreads || []), remoteName, host);
   return completeSessionPayload({
     codexHome: `${host}:~/.codex`,
     source: { type: "remote", remote: remoteName, host },
@@ -4046,33 +3512,11 @@ function buildRemoteSessionPayload(sessionId, remoteName, host, options = {}) {
 
 function buildSessionPayload(sessionId, options = {}) {
   const remoteName = options.remote || "";
-  if (remoteName) return buildRemoteSessionPayload(sessionId, remoteName, resolveRemoteHost(remoteName), options);
-  return buildLocalSessionPayload(sessionId, resolveCodexHome(options.codexHome), options);
-}
-
-function buildLocalSessionQueuePayload(sessionId, codexHome = CODEX_HOME, options = {}) {
-  const index = loadSessionIndex(codexHome);
-  const queue = loadQueueData(sessionId, [], [], codexHome, options);
-  const indexEntry = index.get(sessionId) || {};
-  return {
-    ok: true,
-    generatedAt: new Date().toISOString(),
-    source: { type: "local", codexHome },
-    session: {
-      id: sessionId,
-      title: indexEntry.thread_name || indexEntry.title || "",
-    },
-    queue,
-    queueWorkers: queue.workers || [],
-    warnings: queue.warnings || [],
-  };
+  if (remoteName) return buildRemoteSessionPayload(sessionId, remoteName, resolveRemoteHost(remoteName));
+  return buildLocalSessionPayload(sessionId, resolveCodexHome(options.codexHome));
 }
 
 function buildSessionQueuePayload(sessionId, options = {}) {
-  const remoteName = options.remote || "";
-  if (!remoteName) {
-    return buildLocalSessionQueuePayload(sessionId, resolveCodexHome(options.codexHome), options);
-  }
   const payload = buildSessionPayload(sessionId, options);
   if (!payload.ok) return payload;
   return {
@@ -4086,26 +3530,6 @@ function buildSessionQueuePayload(sessionId, options = {}) {
     queue: payload.queue,
     queueWorkers: payload.queueWorkers || payload.queue?.workers || [],
     warnings: payload.warnings || [],
-  };
-}
-
-function requestOptionsFromSearch(searchParams) {
-  const launcherEvents = String(
-    searchParams.get("events") || searchParams.get("launcher_events") || "",
-  ).toLowerCase();
-  return {
-    remote: searchParams.get("remote") || "",
-    codexHome: searchParams.get("codex_home") || searchParams.get("codexHome") || "",
-    launcherEventsMode: ["all", "full"].includes(launcherEvents) ? "all" : "latest",
-  };
-}
-
-function withLauncherEventMode(payload, options) {
-  if (!payload?.ok) return payload;
-  return {
-    ...payload,
-    launcherEventsMode: options.launcherEventsMode || "latest",
-    launcherEventLimit: MAX_LAUNCHER_EVENT_ROWS,
   };
 }
 
@@ -4189,8 +3613,9 @@ const server = http.createServer((req, res) => {
       return;
     }
     try {
-      const options = requestOptionsFromSearch(parsed.searchParams);
-      const payload = withLauncherEventMode(buildSessionQueuePayload(sessionId, options), options);
+      const remote = parsed.searchParams.get("remote") || "";
+      const codexHome = parsed.searchParams.get("codex_home") || parsed.searchParams.get("codexHome") || "";
+      const payload = buildSessionQueuePayload(sessionId, { remote, codexHome });
       sendJson(res, payload.ok ? 200 : 404, payload);
     } catch (err) {
       sendJson(res, 500, { ok: false, error: err.message, stack: process.env.DEBUG ? err.stack : undefined });
@@ -4206,11 +3631,10 @@ const server = http.createServer((req, res) => {
       return;
     }
     try {
-      const full = ["1", "true", "yes"].includes(String(parsed.searchParams.get("full") || "").toLowerCase());
-      const options = requestOptionsFromSearch(parsed.searchParams);
-      const payload = withLauncherEventMode(buildSessionPayload(sessionId, options), options);
-      const responsePayload = full ? { ...payload, detailMode: "full", detailsComplete: true } : compactSessionPayload(payload);
-      sendJson(res, responsePayload.ok ? 200 : 404, responsePayload);
+      const remote = parsed.searchParams.get("remote") || "";
+      const codexHome = parsed.searchParams.get("codex_home") || parsed.searchParams.get("codexHome") || "";
+      const payload = buildSessionPayload(sessionId, { remote, codexHome });
+      sendJson(res, payload.ok ? 200 : 404, payload);
     } catch (err) {
       sendJson(res, 500, { ok: false, error: err.message, stack: process.env.DEBUG ? err.stack : undefined });
     }

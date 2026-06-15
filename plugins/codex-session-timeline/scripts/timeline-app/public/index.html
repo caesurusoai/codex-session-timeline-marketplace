@@ -12,168 +12,203 @@
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
-    <main class="app-shell">
-      <section class="topbar">
-        <div>
-          <h1>Codex Session Timeline</h1>
-          <p class="subtitle">Session timing, explicit waits, queue backlog, and worker timelines.</p>
-        </div>
-        <form id="session-form" class="session-form">
-          <div id="session-picker" class="session-picker">
-            <input
-              id="session-id"
-              name="session"
-              placeholder="Paste a session id or search thread names"
-              autocomplete="off"
-              role="combobox"
-              aria-autocomplete="list"
-              aria-expanded="false"
-              aria-controls="session-picker-menu"
-            />
-            <button
-              id="session-picker-toggle"
-              class="session-picker-toggle"
-              type="button"
-              aria-label="Show recent sessions"
-            >
-              Recent
+    <svg class="timeline-defs" width="0" height="0" aria-hidden="true" focusable="false">
+      <defs>
+        <pattern id="spawn-stripe" patternUnits="userSpaceOnUse" width="8" height="8">
+          <rect class="spawn-pattern-base" width="8" height="8"></rect>
+          <path class="spawn-pattern-line" d="M-2 8 L8 -2 M2 10 L10 2"></path>
+        </pattern>
+      </defs>
+    </svg>
+    <main class="timeline-app">
+      <section class="workspace">
+        <header class="command-bar">
+          <div class="command-title">
+            <span class="command-mark" aria-hidden="true">
+              <span></span><span></span><span></span><span></span>
+            </span>
+            <span class="command-title-text">
+              <span class="command-label">Session</span>
+              <strong id="command-session-id">Waiting for session</strong>
+            </span>
+          </div>
+          <form id="session-form" class="session-form command-session-form" aria-label="Load session">
+            <div id="session-picker" class="session-picker">
+              <input
+                id="session-id"
+                name="session"
+                placeholder="Filter sessions or paste an id"
+                autocomplete="off"
+                role="combobox"
+                aria-autocomplete="list"
+                aria-expanded="false"
+                aria-controls="session-picker-menu"
+              />
+              <button
+                id="session-picker-toggle"
+                class="session-picker-toggle"
+                type="button"
+                aria-label="Show recent sessions"
+              >
+                Recent
+              </button>
+              <div id="session-picker-menu" class="session-picker-menu" role="listbox" hidden></div>
+            </div>
+            <button class="load-button" type="submit">Load</button>
+          </form>
+          <div class="command-actions">
+            <button id="refresh-session" class="secondary-button refresh-button" type="button" title="Reload this session from disk">
+              Refresh
             </button>
-            <div id="session-picker-menu" class="session-picker-menu" role="listbox" hidden></div>
-          </div>
-          <button type="submit">Load</button>
-        </form>
-      </section>
-
-      <section id="status" class="status muted">Give me a session id to visualize.</section>
-
-      <section id="summary" class="summary-grid" hidden></section>
-
-      <section id="view-tabs" class="view-tabs" hidden>
-        <div class="tab-list" role="tablist" aria-label="Session views">
-          <button id="timeline-tab" class="tab-button is-active" type="button" role="tab" aria-selected="true">
-            Timeline
-          </button>
-          <button id="queues-tab" class="tab-button" type="button" role="tab" aria-selected="false">
-            Queues <span id="queue-tab-count" class="tab-count">0</span>
-          </button>
-        </div>
-      </section>
-
-      <section id="queue-progress-card" class="timeline-panel queue-progress-panel" hidden>
-        <div class="panel-heading">
-          <div>
-            <h2>Queue Progress</h2>
-            <p class="muted">Aggregate queue counts and per-job progress. This view samples details so large queues stay readable.</p>
-          </div>
-          <div class="queue-refresh-controls">
-            <button id="queue-refresh" class="secondary-button" type="button">Refresh queues</button>
-            <label class="queue-auto-refresh">
-              <input id="queue-auto-refresh" type="checkbox" />
-              Auto 10s
-            </label>
-            <span id="queue-refresh-status" class="queue-refresh-status">Not refreshed yet</span>
-          </div>
-        </div>
-        <div id="queue-progress" class="queue-progress"></div>
-      </section>
-
-      <section id="timeline-card" class="timeline-panel" hidden>
-        <div class="panel-heading">
-          <div>
-            <h2>Timeline</h2>
-            <p id="timeline-caption" class="muted"></p>
-          </div>
-          <div class="timeline-toolbar" aria-label="Timeline controls">
-            <div class="timeline-actions">
-              <button id="timeline-pan-left" class="icon-button" type="button" title="Pan left" aria-label="Pan left">&lt;</button>
-              <button id="timeline-zoom-out" class="icon-button" type="button" title="Zoom out" aria-label="Zoom out">-</button>
-              <button id="timeline-zoom-in" class="icon-button" type="button" title="Zoom in" aria-label="Zoom in">+</button>
-              <button id="timeline-pan-right" class="icon-button" type="button" title="Pan right" aria-label="Pan right">&gt;</button>
-              <button id="timeline-reset" class="reset-button" type="button">Reset</button>
-              <button id="load-full-details" class="secondary-button load-full-details" type="button" hidden>
-                Load all details
-              </button>
-              <button id="load-all-events" class="secondary-button load-full-details" type="button" hidden>
-                Load all events
-              </button>
+            <div class="time-window">
+              <span id="command-window-start">--:--:--</span>
+              <span aria-hidden="true">-</span>
+              <span id="command-window-end">--:--:--</span>
+              <b id="command-window-duration">0ms</b>
             </div>
-            <div id="timeline-readout" class="timeline-readout">Full range</div>
-            <div class="legend legend-bars" aria-label="Timeline bars">
-              <span class="legend-label">bars</span>
-              <span><i class="swatch wait"></i>wait</span>
-              <span><i class="swatch tool"></i>tool</span>
-              <span><i class="swatch running"></i>running</span>
-              <span><i class="swatch spawn"></i>spawn</span>
-            </div>
-            <div class="legend legend-events" aria-label="Timeline event markers">
-              <span class="legend-label">events</span>
-              <span><i class="event-symbol user"></i>user</span>
-              <span><i class="event-symbol assistant"></i>assistant</span>
-              <span><i class="event-symbol task"></i>task</span>
-              <span><i class="event-symbol goal"></i>goal</span>
-              <span><i class="event-symbol compact"></i>compact</span>
-              <span><i class="event-symbol app"></i>app</span>
-              <span><i class="event-symbol abort"></i>abort</span>
-            </div>
+            <button id="export-session" class="secondary-button export-button" type="button">Export</button>
           </div>
-        </div>
-        <div id="timeline-wrap" class="timeline-wrap"></div>
-      </section>
+        </header>
 
-      <section id="queue-timeline-card" class="timeline-panel" hidden>
-        <div class="panel-heading">
-          <div>
-            <h2>Queue Workload</h2>
-            <p id="queue-timeline-caption" class="muted"></p>
-          </div>
-          <div class="timeline-toolbar" aria-label="Queue workload legend">
-            <div class="legend legend-bars" aria-label="Queue workload bars">
-              <span class="legend-label">items</span>
-              <span><i class="swatch completed"></i>completed</span>
-              <span><i class="swatch leased"></i>leased</span>
-              <span><i class="swatch queued"></i>queued</span>
-              <span><i class="swatch failed"></i>failed</span>
-            </div>
-          </div>
-        </div>
-        <div id="queue-timeline-wrap" class="timeline-wrap queue-timeline-wrap"></div>
-      </section>
+        <section id="status" class="status muted">Give me a session id to visualize.</section>
+        <section id="summary" class="summary-grid" hidden></section>
 
-      <div id="marker-popover" class="marker-popover" hidden>
-        <article
-          id="marker-popover-card"
-          class="marker-popover-card"
-          role="dialog"
-          aria-modal="false"
-          aria-labelledby="marker-popover-title"
-        >
-          <div class="marker-popover-head">
-            <div>
-              <div id="marker-popover-kicker" class="marker-popover-kicker"></div>
-              <h2 id="marker-popover-title">Event detail</h2>
-            </div>
-            <button
-              id="marker-popover-close"
-              class="marker-popover-close"
-              type="button"
-              aria-label="Close event detail"
-            >
-              &times;
+        <section id="view-tabs" class="view-tabs" hidden>
+          <div class="filter-cluster" aria-label="Timeline filters">
+            <button id="timeline-tab" class="tab-button is-active" type="button" role="tab" aria-selected="true">
+              Timeline
+            </button>
+            <button id="queues-tab" class="tab-button" type="button" role="tab" aria-selected="false">
+              Queues <span id="queue-tab-count" class="tab-count">0</span>
             </button>
           </div>
-          <div id="marker-popover-meta" class="marker-popover-meta"></div>
-          <pre id="marker-popover-body" class="marker-popover-body"></pre>
-        </article>
-      </div>
+          <div class="filter-cluster timeline-filters" aria-label="Visible timeline layers">
+            <label><input id="filter-events" type="checkbox" checked /> Events</label>
+            <label><input id="filter-tools" type="checkbox" checked /> Tools</label>
+            <label><input id="filter-waits" type="checkbox" checked /> Waits</label>
+            <label><input id="filter-spawns" type="checkbox" checked /> Spawns</label>
+          </div>
+        </section>
 
-      <section class="details-grid">
-        <article id="queues" class="detail-panel" hidden>
-          <h2>Queues</h2>
-          <div id="queue-table"></div>
-        </article>
+        <section class="content-grid">
+          <div class="primary-stack">
+            <section id="timeline-card" class="timeline-panel" hidden>
+              <div class="panel-heading">
+                <div>
+                  <h2>Timeline</h2>
+                  <p id="timeline-caption" class="muted"></p>
+                </div>
+                <div class="timeline-toolbar" aria-label="Timeline controls">
+                  <div class="zoom-label">Zoom</div>
+                  <div class="timeline-actions">
+                    <button id="timeline-pan-left" class="icon-button" type="button" title="Pan left" aria-label="Pan left">&lt;</button>
+                    <button id="timeline-zoom-out" class="icon-button" type="button" title="Zoom out" aria-label="Zoom out">-</button>
+                    <button id="timeline-zoom-in" class="icon-button" type="button" title="Zoom in" aria-label="Zoom in">+</button>
+                    <button id="timeline-pan-right" class="icon-button" type="button" title="Pan right" aria-label="Pan right">&gt;</button>
+                    <button id="timeline-reset" class="reset-button" type="button">Reset</button>
+                  </div>
+                  <div id="timeline-readout" class="timeline-readout">Full range</div>
+                  <label class="follow-toggle">
+                    <input id="follow-active" type="checkbox" />
+                    Follow active
+                  </label>
+                  <button id="timeline-now" class="secondary-button now-button" type="button">Now</button>
+                </div>
+              </div>
+              <div id="timeline-wrap" class="timeline-wrap"></div>
+              <div class="timeline-legend" aria-label="Timeline legend">
+                <span><i class="event-symbol user"></i> Event: info</span>
+                <span><i class="event-symbol goal"></i> Event: success</span>
+                <span><i class="event-symbol task"></i> Event: warning</span>
+                <span><i class="event-symbol abort"></i> Event: error</span>
+                <span><i class="legend-bar legend-tool"></i> Tool</span>
+                <span><i class="legend-bar legend-spawn"></i> Spawn</span>
+                <span><i class="legend-bar legend-wait"></i> Wait</span>
+                <span><i class="legend-running"></i> Running</span>
+              </div>
+              <div id="timeline-minimap" class="timeline-minimap" aria-label="Timeline minimap"></div>
+            </section>
+
+            <section id="queue-progress-card" class="timeline-panel queue-progress-panel" hidden>
+              <div class="panel-heading">
+                <div>
+                  <h2>Queues</h2>
+                  <p class="muted">Aggregate queue counts and per-job progress. Large queues stay sampled and scannable.</p>
+                </div>
+                <div class="queue-refresh-controls">
+                  <button id="queue-refresh" class="secondary-button" type="button">Refresh queues</button>
+                  <label class="queue-auto-refresh">
+                    <input id="queue-auto-refresh" type="checkbox" />
+                    Auto 10s
+                  </label>
+                  <span id="queue-refresh-status" class="queue-refresh-status">Not refreshed yet</span>
+                </div>
+              </div>
+              <div id="queue-progress" class="queue-progress"></div>
+            </section>
+
+            <section id="queue-timeline-card" class="timeline-panel" hidden>
+              <div class="panel-heading">
+                <div>
+                  <h2>Queue Workload</h2>
+                  <p id="queue-timeline-caption" class="muted"></p>
+                </div>
+                <div class="timeline-toolbar queue-timeline-toolbar" aria-label="Queue timeline controls">
+                  <div class="zoom-label">Zoom</div>
+                  <div class="timeline-actions">
+                    <button id="queue-timeline-pan-left" class="icon-button" type="button" title="Pan left" aria-label="Pan left">&lt;</button>
+                    <button id="queue-timeline-zoom-out" class="icon-button" type="button" title="Zoom out" aria-label="Zoom out">-</button>
+                    <button id="queue-timeline-zoom-in" class="icon-button" type="button" title="Zoom in" aria-label="Zoom in">+</button>
+                    <button id="queue-timeline-pan-right" class="icon-button" type="button" title="Pan right" aria-label="Pan right">&gt;</button>
+                    <button id="queue-timeline-reset" class="reset-button" type="button">Reset</button>
+                  </div>
+                  <div id="queue-timeline-readout" class="timeline-readout">Full range</div>
+                </div>
+              </div>
+              <div id="queue-timeline-wrap" class="timeline-wrap queue-timeline-wrap"></div>
+            </section>
+
+            <section class="details-grid">
+              <article id="queues" class="detail-panel" hidden>
+                <h2>Queue Table</h2>
+                <div id="queue-table"></div>
+              </article>
+            </section>
+
+            <section id="warnings" class="warnings" hidden></section>
+          </div>
+
+          <aside id="marker-popover" class="detail-inspector" aria-label="Selected span">
+            <div id="inspector-empty" class="inspector-empty">
+              <h2>Selected span</h2>
+              <p>Click a tool, wait, lane, event, or queue item to inspect its timing and captured payload.</p>
+            </div>
+            <article
+              id="marker-popover-card"
+              class="marker-popover-card"
+              aria-labelledby="marker-popover-title"
+              hidden
+            >
+              <div class="marker-popover-head">
+                <div>
+                  <div id="marker-popover-kicker" class="marker-popover-kicker"></div>
+                  <h2 id="marker-popover-title">Selected span</h2>
+                </div>
+                <button
+                  id="marker-popover-close"
+                  class="marker-popover-close"
+                  type="button"
+                  aria-label="Clear selected detail"
+                >
+                  &times;
+                </button>
+              </div>
+              <div id="marker-popover-meta" class="marker-popover-meta"></div>
+              <pre id="marker-popover-body" class="marker-popover-body"></pre>
+            </article>
+          </aside>
+        </section>
       </section>
-
-      <section id="warnings" class="warnings" hidden></section>
     </main>
     <script src="/app.js"></script>
   </body>

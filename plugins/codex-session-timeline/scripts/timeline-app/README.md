@@ -2,6 +2,14 @@
 
 Local dashboard for visualizing a Codex session id: parent timing, wait-heavy tool calls, spawned subagents, Queue Service rows, and queue item lifetimes.
 
+## Interface Highlights
+
+- Sticky session command bar with refresh, export, and active time-window readout.
+- Main timeline with event/tool/wait/spawn filters, drag-to-zoom, and a resizable minimap brush.
+- Nested agent-job and app-worker lanes with compact descriptive labels.
+- Queue workload view with compact queue names, zoom/pan/reset controls, drag-to-zoom, and clickable aggregate heatmap buckets.
+- Right-side detail inspector for selected events, spans, lanes, queue rows, and queue workload buckets.
+
 ## Run
 
 ```bash
@@ -47,3 +55,12 @@ Remote mode reads Codex JSONL files over SSH and copies the remote Queue Service
 The dashboard uses exact transcript timestamps for tool calls, explicit wait calls, spawn calls, messages, compaction, and goal updates. Queue item timing comes from Queue Service rows: created, updated, lease expiry, and completed timestamps.
 
 Subagent "quiet" time means the child session was alive but had no in-flight tool span recorded. That can include model reasoning, UI latency, or true idle time; it is best read as "not directly visible as a tool or explicit wait."
+
+## Local Checks
+
+```bash
+node --check server.js
+node --check public/app.js
+node scripts/verify-render.js "http://127.0.0.1:8787/?session=<session-id>"
+node scripts/verify-interactions.js "http://127.0.0.1:8787/?session=<session-id>"
+```

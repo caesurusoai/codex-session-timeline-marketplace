@@ -5,12 +5,22 @@ const sessionPicker = document.getElementById("session-picker");
 const input = document.getElementById("session-id");
 const sessionPickerToggle = document.getElementById("session-picker-toggle");
 const sessionPickerMenu = document.getElementById("session-picker-menu");
+const commandSessionId = document.getElementById("command-session-id");
+const commandWindowStart = document.getElementById("command-window-start");
+const commandWindowEnd = document.getElementById("command-window-end");
+const commandWindowDuration = document.getElementById("command-window-duration");
+const refreshSessionButton = document.getElementById("refresh-session");
+const exportSessionButton = document.getElementById("export-session");
 const statusEl = document.getElementById("status");
 const summaryEl = document.getElementById("summary");
 const viewTabs = document.getElementById("view-tabs");
 const timelineTab = document.getElementById("timeline-tab");
 const queuesTab = document.getElementById("queues-tab");
 const queueTabCount = document.getElementById("queue-tab-count");
+const filterEvents = document.getElementById("filter-events");
+const filterTools = document.getElementById("filter-tools");
+const filterWaits = document.getElementById("filter-waits");
+const filterSpawns = document.getElementById("filter-spawns");
 const queueProgressCard = document.getElementById("queue-progress-card");
 const queueProgress = document.getElementById("queue-progress");
 const queueRefreshButton = document.getElementById("queue-refresh");
@@ -18,18 +28,25 @@ const queueAutoRefresh = document.getElementById("queue-auto-refresh");
 const queueRefreshStatus = document.getElementById("queue-refresh-status");
 const timelineCard = document.getElementById("timeline-card");
 const timelineWrap = document.getElementById("timeline-wrap");
+const timelineMinimap = document.getElementById("timeline-minimap");
 const timelineCaption = document.getElementById("timeline-caption");
 const queueTimelineCard = document.getElementById("queue-timeline-card");
 const queueTimelineWrap = document.getElementById("queue-timeline-wrap");
 const queueTimelineCaption = document.getElementById("queue-timeline-caption");
+const queueTimelineReadout = document.getElementById("queue-timeline-readout");
+const queueTimelineZoomIn = document.getElementById("queue-timeline-zoom-in");
+const queueTimelineZoomOut = document.getElementById("queue-timeline-zoom-out");
+const queueTimelinePanLeft = document.getElementById("queue-timeline-pan-left");
+const queueTimelinePanRight = document.getElementById("queue-timeline-pan-right");
+const queueTimelineReset = document.getElementById("queue-timeline-reset");
 const timelineReadout = document.getElementById("timeline-readout");
 const timelineZoomIn = document.getElementById("timeline-zoom-in");
 const timelineZoomOut = document.getElementById("timeline-zoom-out");
 const timelinePanLeft = document.getElementById("timeline-pan-left");
 const timelinePanRight = document.getElementById("timeline-pan-right");
 const timelineReset = document.getElementById("timeline-reset");
-const loadFullDetailsButton = document.getElementById("load-full-details");
-const loadAllEventsButton = document.getElementById("load-all-events");
+const timelineNow = document.getElementById("timeline-now");
+const followActive = document.getElementById("follow-active");
 const subagentsPanel = document.getElementById("subagents");
 const subagentTable = document.getElementById("subagent-table");
 const queuesPanel = document.getElementById("queues");
@@ -37,6 +54,7 @@ const queueTable = document.getElementById("queue-table");
 const warningsEl = document.getElementById("warnings");
 const markerPopover = document.getElementById("marker-popover");
 const markerPopoverCard = document.getElementById("marker-popover-card");
+const inspectorEmpty = document.getElementById("inspector-empty");
 const markerPopoverKicker = document.getElementById("marker-popover-kicker");
 const markerPopoverTitle = document.getElementById("marker-popover-title");
 const markerPopoverMeta = document.getElementById("marker-popover-meta");
@@ -48,14 +66,17 @@ let activeView = "timeline";
 let queueRefreshTimer = null;
 let queueRefreshInFlight = false;
 let queueLastRefreshed = null;
-let fullDetailsLoading = false;
-let allEventsLoading = false;
 let timelineView = null;
 let timelineDrag = null;
+let minimapDrag = null;
+let queueTimelineView = null;
+let queueTimelineDrag = null;
 let markerLookup = new Map();
 let spanLookup = new Map();
 let laneLookup = new Map();
 let queueItemLookup = new Map();
+let queueActivityLookup = new Map();
+let queueLaneLookup = new Map();
 let sessionSuggestions = [];
 let highlightedSessionSuggestion = -1;
 let sessionSuggestionTimer = null;
@@ -63,6 +84,70 @@ let sessionSuggestionRequest = 0;
 
 const MIN_TIMELINE_WINDOW_MS = 30 * 1000;
 const DRAG_ZOOM_MIN_PX = 8;
+const MINIMAP_DRAG_MIN_PX = 6;
+const MINIMAP_HANDLE_HIT_PX = 14;
+
+function timelineFilters() {
+  return {
+    events: filterEvents?.checked !== false,
+    tools: filterTools?.checked !== false,
+    waits: filterWaits?.checked !== false,
+    spawns: filterSpawns?.checked !== false,
+  };
+}
+
+function spanVisualType(span) {
+  if (!span || typeof span === "string") return span || "tool";
+  const type = span.type || "tool";
+  const name = String(span.name || span.label || "");
+  if (type === "spawn" || name === "spawn_agent" || name === "spawn_agents_on_csv") return "spawn";
+  return type;
+}
+
+function shouldShowSpan(span) {
+  const filters = timelineFilters();
+  const type = spanVisualType(span);
+  if (type === "wait") return filters.waits;
+  if (type === "spawn") return filters.spawns;
+  return filters.tools;
+}
+
+function shouldShowMarker() {
+  return timelineFilters().events;
+}
+
+function updateCommandChrome(data) {
+  const session = data?.session;
+  const domain = data?.domain;
+  const title = session?.title || "Untitled session";
+  const id = session?.id || "Waiting for session";
+  const duration = domain ? fmtDuration(domain.end - domain.start) : "0ms";
+
+  if (commandSessionId) commandSessionId.textContent = id;
+  if (commandWindowStart) commandWindowStart.textContent = domain ? fmtTime(domain.start) : "--:--:--";
+  if (commandWindowEnd) commandWindowEnd.textContent = domain ? fmtTime(domain.end) : "--:--:--";
+  if (commandWindowDuration) commandWindowDuration.textContent = duration;
+}
+
+function setSessionRefreshBusy(busy) {
+  if (!refreshSessionButton) return;
+  refreshSessionButton.disabled = busy;
+  refreshSessionButton.textContent = busy ? "Refreshing..." : "Refresh";
+}
+
+function exportCurrentSession() {
+  if (!currentData) return;
+  const payload = JSON.stringify(currentData, null, 2);
+  const blob = new Blob([payload], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `codex-session-${currentData.session.id}.json`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
 
 function fmtDuration(ms) {
   if (!Number.isFinite(ms) || ms <= 0) return "0ms";
@@ -170,81 +255,18 @@ function agentJobId(session) {
   return kind.startsWith("agent_job:") ? kind.slice("agent_job:".length) : "";
 }
 
-function agentJobItemId(session) {
-  return promptField(firstMarkerDetail(session, "user"), "Item ID");
-}
+const LEADING_UUID_PREFIX_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}-(.+)$/i;
 
-function agentJobDisplayName(session) {
-  const itemId = agentJobItemId(session);
-  if (itemId) return itemId;
-  if (session.meta?.agentNickname) return session.meta.agentNickname;
-  if (session.title && session.title !== session.id) return session.title;
-  const job = agentJobId(session);
-  if (job) return `${job.slice(0, 8)} worker`;
-  return session.id.slice(0, 13);
-}
-
-function agentJobSessionLabel(session) {
-  const itemId = agentJobItemId(session);
-  const job = agentJobId(session);
-  if (itemId && job) return `${itemId} (${job})`;
-  return itemId || job || session.id;
-}
-
-function stripUuidPrefix(value) {
-  return String(value || "").replace(
-    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}[-_:]*/i,
-    "",
-  );
-}
-
-function humanizeWorkerSlug(value) {
-  return String(value || "")
-    .replace(/^deep[-_]+/i, "")
-    .replace(/[-_]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function workerNumberFromId(workerId) {
-  const match = String(workerId || "").match(/(?:^|[-_])worker[-_]?(\d+)$/i);
-  return match ? match[1] : "";
-}
-
-function workerRoleFromSource(source, fallback = "") {
-  const workerId = source?.worker_id || fallback || "";
-  const candidates = [
-    source?.job_id,
-    ...(Array.isArray(source?.queues) ? source.queues : []),
-    workerId.replace(/(?:^|[-_])worker[-_]?\d+$/i, ""),
-  ];
-
-  for (const candidate of candidates) {
-    const cleaned = stripUuidPrefix(candidate);
-    const roleMatch = cleaned.match(
-      /(?:^|[-_])(deep[-_]+file[-_]+review|deep[-_]+threat[-_]+model|file[-_]+review|threat[-_]+model|cvss[-_]+scoring|finding[-_]+discovery|validation|rerank|triage)(?=$|[-_])/i,
-    );
-    const role = humanizeWorkerSlug(roleMatch ? roleMatch[1] : cleaned);
-    if (role && !/^[0-9a-f-]{8,}$/i.test(role)) return role;
-  }
-
-  return "";
-}
-
-function workerDisplayName(source, fallback = "") {
-  const workerId = source?.worker_id || fallback || "";
-  const number = workerNumberFromId(workerId);
-  const role = workerRoleFromSource(source, fallback);
-  if (role && number) return `${role} #${number}`;
-  if (role) return role;
-  if (number) return `worker #${number}`;
-  return stripUuidPrefix(workerId) || fallback;
+function compactWorkerName(value) {
+  const text = String(value || "").trim();
+  const match = text.match(LEADING_UUID_PREFIX_RE);
+  return match ? match[1] : text;
 }
 
 function childSessionDisplay(session) {
   if (isQueueWorkerSession(session)) {
     const source = session.meta?.source?.queue_worker || {};
-    const name = workerDisplayName(source, session.meta?.agentNickname || session.title || session.id.slice(0, 13));
+    const name = source.worker_id || session.meta?.agentNickname || session.title || session.id.slice(0, 13);
     return {
       lanePrefix: "queue worker",
       name,
@@ -256,7 +278,8 @@ function childSessionDisplay(session) {
 
   if (isAppThreadSession(session)) {
     const source = session.meta?.source?.app_server || {};
-    const name = workerDisplayName(source, session.meta?.agentNickname || session.title || session.id.slice(0, 13));
+    const rawName = source.worker_id || session.meta?.agentNickname || session.title || session.id.slice(0, 13);
+    const name = source.worker_id ? compactWorkerName(rawName) : rawName;
     const lanePrefix = source.worker_id ? "app worker" : "app thread";
     return {
       lanePrefix,
@@ -278,13 +301,12 @@ function childSessionDisplay(session) {
   }
 
   if (isAgentJobSession(session)) {
-    const name = agentJobDisplayName(session);
     return {
-      lanePrefix: "agent job",
-      name,
-      tableName: "agent job",
+      lanePrefix: "agent_job",
+      name: session.id.slice(0, 13),
+      tableName: "agent_job",
       tableClass: "pill pill-agent-job",
-      sessionLabel: agentJobSessionLabel(session),
+      sessionLabel: session.id,
     };
   }
 
@@ -356,14 +378,7 @@ function appThreadTaskSummary(session) {
   if (source.events_file) lines.push(`Events file: ${source.events_file}`);
   if (source.done_file) lines.push(`Done file: ${source.done_file}`);
   if (source.event_rows != null) {
-    const loaded = source.event_rows_loaded ?? source.event_rows;
-    const omitted = source.event_rows_omitted || 0;
-    const rowWindow = source.event_rows_window === "latest" ? "latest" : "all";
-    lines.push(
-      `Launcher event rows parsed: ${loaded}/${source.event_rows}${
-        source.event_rows_truncated ? ` (${rowWindow}; ${omitted} older omitted)` : ""
-      }`,
-    );
+    lines.push(`Launcher event rows parsed: ${source.event_rows}${source.event_rows_truncated ? " (truncated)" : ""}`);
   }
   if (source.prompt) {
     const promptLabel = String(source.created_via || "").includes("launcher")
@@ -466,6 +481,46 @@ function mainSessionRows(data) {
   ];
 }
 
+function timelineChildRows(data) {
+  const children = data.subagents || [];
+  const byParent = new Map();
+  const emitted = new Set();
+  for (const child of children) {
+    const parentId = child.parentSessionId || data.session.id;
+    if (!byParent.has(parentId)) byParent.set(parentId, []);
+    byParent.get(parentId).push(child);
+  }
+  for (const group of byParent.values()) {
+    group.sort((a, b) => (a.start || 0) - (b.start || 0));
+  }
+
+  const ordered = [];
+  const visit = (parentId) => {
+    for (const child of byParent.get(parentId) || []) {
+      if (emitted.has(child.id)) continue;
+      emitted.add(child.id);
+      ordered.push(child);
+      visit(child.id);
+    }
+  };
+  visit(data.session.id);
+
+  for (const child of children.slice().sort((a, b) => (a.start || 0) - (b.start || 0))) {
+    if (emitted.has(child.id)) continue;
+    emitted.add(child.id);
+    ordered.push(child);
+  }
+  return ordered;
+}
+
+function timelineSessionRows(data) {
+  return [
+    data.session,
+    ...timelineChildRows(data),
+    ...(data.appThreads || []),
+  ];
+}
+
 function activeSpansForSession(session) {
   return (session.spans || [])
     .filter((span) => span.active || span.status === "running")
@@ -489,8 +544,9 @@ function currentActivityMetric(data) {
   const newest = active[active.length - 1];
   const owner = sessionDisplayName(newest.session, data.session.id);
   const others = active.length > 1 ? `; ${active.length - 1} other active call${active.length === 2 ? "" : "s"}` : "";
+  const visualType = spanVisualType(newest);
   const activityKind =
-    newest.type === "wait" ? "wait" : newest.type === "spawn" ? "spawn" : "tool";
+    visualType === "wait" ? "wait" : visualType === "spawn" ? "spawn" : "tool";
   return metric(
     "Current activity",
     `running ${activityKind}`,
@@ -502,6 +558,9 @@ function openSessionPopover(session, target) {
   if (!session) return;
   const display = childSessionDisplay(session);
   const prompt = firstMarkerDetail(session, "user");
+  const parentLine = session.parentSessionId
+    ? `Spawned by: ${session.parentSessionLabel || session.parentSessionId} (${session.parentSessionId})`
+    : "";
   const sections = [
     "Task",
     sessionTaskSummary(session),
@@ -515,6 +574,7 @@ function openSessionPopover(session, target) {
       session.start ? `Started: ${fmtDateTime(session.start)}` : "",
       session.end ? `Ended: ${fmtDateTime(session.end)}` : "",
       session.meta?.cwd ? `Working directory: ${session.meta.cwd}` : "",
+      parentLine,
       subagentSourceKind(session) ? `Source: ${subagentSourceKind(session)}` : "",
       isAppThreadSession(session) ? "Source: codex_app app-server thread" : "",
       isQueueWorkerSession(session) ? "Source: Queue Service item records" : "",
@@ -552,70 +612,13 @@ function currentCodexHome() {
   return params.get("codex_home") || params.get("codexHome") || "";
 }
 
-function apiQueryString(extra = {}) {
+function apiQueryString() {
   const params = new URLSearchParams();
   const remote = currentRemote();
   const codexHome = currentCodexHome();
   if (remote) params.set("remote", remote);
   if (codexHome && !remote) params.set("codex_home", codexHome);
-  for (const [key, value] of Object.entries(extra || {})) {
-    if (value === undefined || value === null || value === false || value === "") continue;
-    params.set(key, String(value));
-  }
   return params.toString() ? `?${params.toString()}` : "";
-}
-
-function updateFullDetailsButton() {
-  if (!loadFullDetailsButton) return;
-  if (!currentData) {
-    loadFullDetailsButton.hidden = true;
-    loadFullDetailsButton.disabled = true;
-    return;
-  }
-  loadFullDetailsButton.hidden = false;
-  if (fullDetailsLoading) {
-    loadFullDetailsButton.disabled = true;
-    loadFullDetailsButton.textContent = "Loading all details...";
-    return;
-  }
-  const full = currentData.detailMode === "full" || currentData.detailsComplete;
-  loadFullDetailsButton.disabled = full;
-  loadFullDetailsButton.textContent = full ? "All details loaded" : "Load all details";
-}
-
-function launcherEventSummary(data) {
-  const sources = (data?.appThreads || [])
-    .map((thread) => thread?.meta?.source?.app_server)
-    .filter(Boolean);
-  const total = sources.reduce((sum, source) => sum + Number(source.event_rows || 0), 0);
-  const loaded = sources.reduce(
-    (sum, source) => sum + Number(source.event_rows_loaded ?? source.event_rows ?? 0),
-    0,
-  );
-  const truncated = sources.some((source) => source.event_rows_truncated);
-  return { total, loaded, truncated };
-}
-
-function updateAllEventsButton() {
-  if (!loadAllEventsButton) return;
-  if (!currentData) {
-    loadAllEventsButton.hidden = true;
-    loadAllEventsButton.disabled = true;
-    return;
-  }
-  const summary = launcherEventSummary(currentData);
-  loadAllEventsButton.hidden = !summary.total;
-  if (loadAllEventsButton.hidden) return;
-  if (allEventsLoading) {
-    loadAllEventsButton.disabled = true;
-    loadAllEventsButton.textContent = "Loading all events...";
-    return;
-  }
-  const allLoaded = currentData.launcherEventsMode === "all" || !summary.truncated;
-  loadAllEventsButton.disabled = allLoaded;
-  loadAllEventsButton.textContent = allLoaded
-    ? "All events loaded"
-    : `Load all events (${fmtCount(summary.loaded)}/${fmtCount(summary.total)})`;
 }
 
 function setQueueRefreshStatus(text, className = "") {
@@ -782,6 +785,20 @@ async function submitSessionId(sessionId) {
   }
 }
 
+async function refreshCurrentSession() {
+  const id = String(currentData?.session?.id || input?.value || "").trim();
+  if (!id) return;
+  setSessionRefreshBusy(true);
+  try {
+    await loadSession(id);
+  } catch (err) {
+    currentData = null;
+    updateStatus(err.message || "Unable to refresh session.", "");
+  } finally {
+    setSessionRefreshBusy(false);
+  }
+}
+
 function selectSessionSuggestion(index) {
   const row = sessionSuggestions[index];
   if (!row?.id) return;
@@ -792,14 +809,11 @@ async function loadSession(sessionId) {
   const remote = currentRemote();
   const codexHome = currentCodexHome();
   timelineView = null;
-  fullDetailsLoading = false;
-  allEventsLoading = false;
+  queueTimelineView = null;
+  queueTimelineDrag = null;
   stopQueueAutoRefresh();
   if (queueAutoRefresh) queueAutoRefresh.checked = false;
   setQueueRefreshStatus("Not refreshed yet");
-  currentData = null;
-  updateFullDetailsButton();
-  updateAllEventsButton();
   closeMarkerPopover();
   updateStatus(`Loading ${sessionId}${remote ? ` from ${remote}` : codexHome ? " from custom CODEX_HOME" : ""}...`);
   summaryEl.hidden = true;
@@ -819,74 +833,38 @@ async function loadSession(sessionId) {
   render(data);
 }
 
-async function loadFullDetails() {
-  if (!currentData?.session?.id || fullDetailsLoading) return;
-  const sessionId = currentData.session.id;
-  const previousView = activeView;
-  const previousTimelineView = timelineView ? { ...timelineView } : null;
-  fullDetailsLoading = true;
-  updateFullDetailsButton();
-  updateStatus(`Loading all details for ${sessionId}...`);
-  try {
-    const res = await fetch(`/api/session/${encodeURIComponent(sessionId)}${apiQueryString({ full: 1 })}`);
-    const data = await res.json();
-    if (!res.ok || !data.ok) throw new Error(data.error || "Unable to load full details.");
-    currentData = data;
-    timelineView = previousTimelineView;
-    render(data);
-    setActiveView(previousView);
-  } catch (err) {
-    updateStatus(err.message || "Unable to load full details.", "");
-  } finally {
-    fullDetailsLoading = false;
-    updateFullDetailsButton();
-  }
-}
-
-async function loadAllEvents() {
-  if (!currentData?.session?.id || allEventsLoading) return;
-  const sessionId = currentData.session.id;
-  const previousView = activeView;
-  const previousTimelineView = timelineView ? { ...timelineView } : null;
-  const full = currentData.detailMode === "full" || currentData.detailsComplete;
-  allEventsLoading = true;
-  updateAllEventsButton();
-  updateStatus(`Loading all launcher events for ${sessionId}...`);
-  try {
-    const res = await fetch(
-      `/api/session/${encodeURIComponent(sessionId)}${apiQueryString({ full: full ? 1 : "", events: "all" })}`,
-    );
-    const data = await res.json();
-    if (!res.ok || !data.ok) throw new Error(data.error || "Unable to load all launcher events.");
-    currentData = data;
-    timelineView = previousTimelineView;
-    render(data);
-    setActiveView(previousView);
-  } catch (err) {
-    updateStatus(err.message || "Unable to load all launcher events.", "");
-  } finally {
-    allEventsLoading = false;
-    updateAllEventsButton();
-  }
-}
-
 function render(data) {
   const session = data.session;
-  const queue = data.queue || {};
+  const queue = data.queue;
   const appThreads = data.appThreads || [];
   const queueWorkers = data.queueWorkers || queue.workers || [];
-  const subagents = data.subagents || [];
-  const childRows = [...subagents, ...appThreads];
+  const childRows = [...(data.subagents || []), ...appThreads];
   const totalElapsed = data.domain.end - data.domain.start;
   const allWaitMs =
     session.metrics.waitMs +
     childRows.reduce((sum, child) => sum + child.metrics.waitMs, 0);
+  const childElapsed = childRows.reduce((sum, child) => sum + child.elapsedMs, 0);
   const remoteLabel = data.source?.type === "remote" ? ` | remote: ${data.source.remote}` : "";
+  const internalReviewers = data.subagents.filter(isInternalApprovalReviewer).length;
+  const agentJobs = data.subagents.filter(isAgentJobSession).length;
+  const namedAgents = data.subagents.length - internalReviewers - agentJobs;
+  const appWorkers = appThreads.filter((thread) => thread.meta?.source?.app_server?.worker_id).length;
+  const appOnlyThreads = appThreads.length - appWorkers;
   const queueWorkerCount = queueWorkers.length;
+  const childSessionHint = [
+    namedAgents ? `${namedAgents} named agent${namedAgents === 1 ? "" : "s"}` : "",
+    agentJobs ? `${agentJobs} agent_job worker${agentJobs === 1 ? "" : "s"}` : "",
+    appWorkers ? `${appWorkers} app-server worker${appWorkers === 1 ? "" : "s"}` : "",
+    appOnlyThreads ? `${appOnlyThreads} app-server thread${appOnlyThreads === 1 ? "" : "s"}` : "",
+    internalReviewers ? `${internalReviewers} internal approval reviewer${internalReviewers === 1 ? "" : "s"}` : "",
+  ]
+    .filter(Boolean)
+    .join(", ");
 
   updateStatus(
     `${session.title || "Untitled session"} | ${session.id}${remoteLabel} | ${fmtDateTime(data.domain.start)} to ${fmtDateTime(data.domain.end)}`,
   );
+  updateCommandChrome(data);
 
   const currentActivity = currentActivityMetric(data);
   summaryEl.innerHTML = [
@@ -894,6 +872,11 @@ function render(data) {
     metric("Parent wait", fmtDuration(session.metrics.waitMs), `${pct(session.metrics.waitMs, session.elapsedMs)} of parent session`),
     metric("All explicit wait", fmtDuration(allWaitMs), "queue_wait_for_event and wait-like tools"),
     currentActivity,
+    metric(
+      "Child activity",
+      String(childRows.length),
+      childSessionHint || `${fmtDuration(childElapsed)} summed live span`,
+    ),
     metric(
       "Queue items",
       String(queue.stats.total || 0),
@@ -920,9 +903,8 @@ function render(data) {
       ? "Parent thread, child sessions, and app-server workers share the same time scale. Queue item processing is separated into the Queues tab so large queues do not slow this graph down."
       : "Parent thread events only. Click bars or dots for details.";
   renderTimeline(data);
+  if (followActive?.checked) focusActiveSpan();
   updateTimelineControls(data);
-  updateFullDetailsButton();
-  updateAllEventsButton();
   timelineCard.hidden = false;
 
   renderQueues(queue);
@@ -935,12 +917,7 @@ function render(data) {
 }
 
 function hasQueueData(queue) {
-  return Boolean(
-    (queue?.stats?.total || 0) ||
-      (queue?.queues || []).length ||
-      (queue?.itemRowsTotal || 0) ||
-      (queue?.unlinkedQueues || []).length,
-  );
+  return Boolean((queue?.stats?.total || 0) || (queue?.queues || []).length || (queue?.itemRowsTotal || 0));
 }
 
 function setActiveView(view) {
@@ -960,6 +937,9 @@ function applyActiveView() {
   timelineCard.hidden = showQueues;
   queueProgressCard.hidden = !showQueues;
   queueTimelineCard.hidden = !showQueues || !hasQueueData(queue) || !(queue.timeline || []).length;
+  const childCount =
+    (currentData.subagents || []).length +
+    (currentData.appThreads || []).length;
   if (subagentsPanel) subagentsPanel.hidden = true;
   queuesPanel.hidden = !showQueues || !hasQueueData(queue);
 }
@@ -1003,71 +983,35 @@ function queueProgressSummaryCard(label, value, hint, className = "") {
   `;
 }
 
+function queueNameForDisplay(value) {
+  return compactWorkerName(value || "");
+}
+
 function queueDisplayName(queue) {
-  const name = queue?.name || "";
+  const name = queueNameForDisplay(queue?.name || "");
   return name.length > 78 ? `${name.slice(0, 34)}...${name.slice(-34)}` : name;
 }
 
-function queueActiveItems(queue) {
-  return Number(queue?.counts?.queued || 0) + Number(queue?.counts?.leased || 0);
-}
-
-function queueSortForVisibility(a, b) {
-  const activeDiff = queueActiveItems(b) - queueActiveItems(a);
-  if (activeDiff) return activeDiff;
-  const statusRank = { running: 0, pending: 1, completed: 2, failed: 3, cancelled: 4 };
-  const statusDiff = (statusRank[a.status] ?? 9) - (statusRank[b.status] ?? 9);
-  if (statusDiff) return statusDiff;
-  const updatedDiff = (Date.parse(b.updatedAt || b.lastActivityAt || "") || 0) -
-    (Date.parse(a.updatedAt || a.lastActivityAt || "") || 0);
-  if (updatedDiff) return updatedDiff;
-  return String(a.name || "").localeCompare(String(b.name || ""));
-}
-
-function fmtQueueDate(value) {
-  const ms = Date.parse(value || "");
-  return Number.isFinite(ms) ? fmtDateTime(ms) : "";
-}
-
-function queueSourceLabel(queue) {
-  return queue.source === "codex-security" ? "Codex Security DB" : "Queue Service";
-}
-
-function queueLinkLabel(queue) {
-  if (queue.linkedToSession) return "linked to this session";
-  if (queue.linkStatus === "other-session") return "linked to other session";
-  if (queue.linkStatus === "unlinked") return queue.heartbeatStale ? "unlinked / stale heartbeat" : "unlinked";
-  return "";
-}
-
-function queueBadge(text, className = "") {
-  return text ? `<span class="queue-badge ${className}">${esc(text)}</span>` : "";
-}
-
-function queueProgressRow(queue, options = {}) {
+function queueProgressRow(queue) {
   const counts = queue.counts || {};
   const total = Number(counts.total || 0);
-  const active = queueActiveItems(queue);
+  const active = Number(counts.queued || 0) + Number(counts.leased || 0);
   const completed = Number(counts.completed || 0);
   const donePct = total ? Math.round((completed / total) * 100) : 0;
-  const diagnostic = Boolean(options.diagnostic || queue.diagnosticReason);
-  const rowClass = `queue-row ${diagnostic ? "queue-row-diagnostic" : ""}`.trim();
-  const updatedAt = fmtQueueDate(queue.updatedAt || queue.lastActivityAt);
-  const completedAt = fmtQueueDate(queue.lastCompletedAt);
-  const heartbeatAt = fmtQueueDate(queue.parentHeartbeatAt);
-  const linkLabel = queueLinkLabel(queue);
-  const badges = [
-    queueBadge(queue.status ? `job ${queue.status}` : "", `queue-badge-status status-${esc(queue.status || "unknown")}`),
-    queueBadge(queueSourceLabel(queue), "queue-badge-source"),
-    queueBadge(linkLabel, queue.linkedToSession ? "queue-badge-linked" : "queue-badge-warning"),
-    queue.heartbeatStale ? queueBadge("stale heartbeat", "queue-badge-warning") : "",
-  ].join("");
+  const meta = [
+    queue.status ? `job ${queue.status}` : "",
+    queue.source === "codex-security" ? "Codex Security DB" : "Queue Service",
+    queue.workerCount ? `${fmtCount(queue.workerCount)} worker${queue.workerCount === 1 ? "" : "s"}` : "",
+    queue.sampleRowsLoaded != null ? `${fmtCount(queue.sampleRowsLoaded)} samples loaded` : "",
+  ]
+    .filter(Boolean)
+    .join(" · ");
   return `
-    <article class="${rowClass}">
+    <article class="queue-row">
       <div class="queue-row-main">
         <div>
           <h3 title="${esc(queue.name || "")}">${esc(queueDisplayName(queue))}</h3>
-          <div class="queue-badges">${badges}</div>
+          <p class="muted" title="${esc(queue.namespace || "")}">${esc(meta || shortNamespace(queue.namespace || ""))}</p>
         </div>
         <div class="queue-row-percent">${donePct}% done</div>
       </div>
@@ -1081,35 +1025,7 @@ function queueProgressRow(queue, options = {}) {
         <span><b>${fmtCount(total)}</b> total</span>
         ${active ? `<span><b>${fmtDuration(Date.now() - (Date.parse(queue.updatedAt || queue.lastActivityAt || new Date()) || Date.now()))}</b> since update</span>` : ""}
       </div>
-      <div class="queue-detail-grid">
-        <span title="${esc(queue.namespace || "")}"><b>Job</b> ${esc(shortNamespace(queue.namespace || queue.name || ""))}</span>
-        ${queue.workerCount != null ? `<span><b>Workers</b> ${fmtCount(queue.workerCount)}</span>` : ""}
-        ${queue.sampleRowsLoaded != null ? `<span><b>Samples</b> ${fmtCount(queue.sampleRowsLoaded)}</span>` : ""}
-        ${updatedAt ? `<span><b>Updated</b> ${esc(updatedAt)}</span>` : ""}
-        ${completedAt ? `<span><b>Completed</b> ${esc(completedAt)}</span>` : ""}
-        ${queue.parentThreadId ? `<span title="${esc(queue.parentThreadId)}"><b>Parent</b> ${esc(queue.parentThreadId)}</span>` : ""}
-        ${heartbeatAt ? `<span><b>Heartbeat</b> ${esc(heartbeatAt)}</span>` : ""}
-        ${queue.diagnosticReason ? `<span><b>Diagnostic</b> ${esc(queue.diagnosticReason)}</span>` : ""}
-        ${queue.dbPath ? `<span class="queue-db-path" title="${esc(queue.dbPath)}"><b>DB</b> ${esc(compactPath(queue.dbPath))}</span>` : ""}
-      </div>
     </article>
-  `;
-}
-
-function queueSection(title, hint, rows, options = {}) {
-  return `
-    <section class="queue-section ${options.className || ""}">
-      <div class="queue-section-heading">
-        <div>
-          <h3>${esc(title)}</h3>
-          <p class="muted">${esc(hint || "")}</p>
-        </div>
-        <span class="queue-section-count">${fmtCount(rows.length)} job${rows.length === 1 ? "" : "s"}</span>
-      </div>
-      <div class="queue-list">
-        ${rows.length ? rows.map((queue) => queueProgressRow(queue, options)).join("") : `<div class="queue-empty"><h3>No queue jobs</h3><p class="muted">No rows matched this section.</p></div>`}
-      </div>
-    </section>
   `;
 }
 
@@ -1117,12 +1033,15 @@ function renderQueueProgress(queue) {
   if (!queueProgress) return;
   const stats = queue?.stats || {};
   const total = Number(queue?.itemRowsTotal || stats.total || 0);
-  const unlinkedQueues = (queue?.unlinkedQueues || []).slice().sort(queueSortForVisibility);
-  const unlinkedTotal = unlinkedQueues.reduce((sum, item) => sum + Number(item.counts?.total || 0), 0);
   const queues = (queue?.queues || [])
     .slice()
-    .sort(queueSortForVisibility);
-  if (queueTabCount) queueTabCount.textContent = fmtCount((total || stats.total || 0) + unlinkedTotal || queues.length + unlinkedQueues.length);
+    .sort((a, b) => {
+      const aActive = Number(a.counts?.queued || 0) + Number(a.counts?.leased || 0);
+      const bActive = Number(b.counts?.queued || 0) + Number(b.counts?.leased || 0);
+      if (aActive !== bActive) return bActive - aActive;
+      return String(a.name || "").localeCompare(String(b.name || ""));
+    });
+  if (queueTabCount) queueTabCount.textContent = fmtCount(total || queues.length);
 
   const dbPaths = queue?.dbPaths || (queue?.dbPath ? [queue.dbPath] : []);
   if (!hasQueueData(queue)) {
@@ -1145,7 +1064,6 @@ function renderQueueProgress(queue) {
       ${queueProgressSummaryCard("Done", fmtCount(stats.completed || 0), `${progressPct(stats.completed || 0, stats.total || total).toFixed(0)}% complete`, "completed")}
       ${queueProgressSummaryCard("Failed", fmtCount(stats.failed || 0), stats.cancelled ? `${fmtCount(stats.cancelled)} cancelled` : "failed items", "failed")}
       ${queueProgressSummaryCard("Active", fmtCount(active), "queued + leased")}
-      ${unlinkedQueues.length ? queueProgressSummaryCard("Unlinked", fmtCount(unlinkedTotal), `${fmtCount(unlinkedQueues.length)} active/stale diagnostic queue${unlinkedQueues.length === 1 ? "" : "s"}`, "diagnostic") : ""}
     </div>
     <div class="queue-progress-overall">
       ${queueProgressBar({
@@ -1157,25 +1075,12 @@ function renderQueueProgress(queue) {
         cancelled: stats.cancelled || 0,
       })}
     </div>
-    ${queueSection(
-      "Linked Queues",
-      "Queue jobs with an ownership link to this Codex session. These drive the totals above.",
-      queues,
-    )}
-    ${
-      unlinkedQueues.length
-        ? queueSection(
-            "Unlinked Queue Diagnostics",
-            "Active or stale queue jobs found in the same scan root but not linked to this session by parent_thread_id.",
-            unlinkedQueues,
-            { diagnostic: true, className: "queue-section-diagnostic" },
-          )
-        : ""
-    }
+    <div class="queue-list">
+      ${queues.map(queueProgressRow).join("")}
+    </div>
     <p class="muted queue-footnote" title="${esc(dbPaths.join("\n"))}">
       ${fmtCount(queue.itemRowsLoaded || 0)} sampled item row${(queue.itemRowsLoaded || 0) === 1 ? "" : "s"} loaded from ${fmtCount(dbPaths.length)} DB${dbPaths.length === 1 ? "" : "s"}.
       ${queue.truncated ? "Details are sample-capped; totals come from SQL counts." : "Totals and samples are fully loaded for the discovered queue rows."}
-      ${unlinkedQueues.length ? ` ${fmtCount(unlinkedTotal)} diagnostic item${unlinkedTotal === 1 ? "" : "s"} are shown separately and not included in linked-session totals.` : ""}
     </p>
   `;
 }
@@ -1262,21 +1167,27 @@ function markerPaintRank(type) {
 }
 
 function closeMarkerPopover() {
-  if (!markerPopover) return;
-  markerPopover.hidden = true;
+  if (!markerPopoverCard) return;
+  markerPopoverCard.hidden = true;
+  if (inspectorEmpty) inspectorEmpty.hidden = false;
 }
 
 function openDetailPopover(detail, target) {
-  if (!markerPopover || !markerPopoverCard || !detail) return;
+  if (!markerPopoverCard || !detail) return;
 
   markerPopoverKicker.textContent = detail.kicker || "";
   markerPopoverTitle.textContent = detail.title || "Detail";
   markerPopoverMeta.textContent = (detail.meta || []).filter(Boolean).join(" | ");
   markerPopoverBody.textContent = detail.body || "No detail payload was captured for this item.";
 
-  markerPopover.hidden = false;
-  placeMarkerPopover(target);
-  markerPopoverClose?.focus({ preventScroll: true });
+  if (inspectorEmpty) inspectorEmpty.hidden = true;
+  markerPopoverCard.hidden = false;
+  if (target?.classList?.contains("span-clickable")) {
+    document.querySelectorAll(".span-clickable.is-selected").forEach((node) => {
+      node.classList.remove("is-selected");
+    });
+    target.classList.add("is-selected");
+  }
 }
 
 function openMarkerPopover(marker, target) {
@@ -1312,10 +1223,11 @@ function spanPaintRank(type) {
 function openSpanPopover(span, target) {
   if (!span) return;
   const running = span.active || span.status === "running";
+  const visualType = spanVisualType(span);
   openDetailPopover(
     {
-      kicker: running ? "running" : span.type || "span",
-      title: running ? `Running ${spanKindLabel(span.type).toLowerCase()}` : spanKindLabel(span.type),
+      kicker: running ? "running" : visualType || span.type || "span",
+      title: running ? `Running ${spanKindLabel(visualType).toLowerCase()}` : spanKindLabel(visualType),
       meta: [
         fmtDateTime(span.start),
         `${fmtDuration(span.durationMs)}${running ? " so far" : " duration"}`,
@@ -1330,6 +1242,7 @@ function openSpanPopover(span, target) {
 }
 
 function placeMarkerPopover(target) {
+  if (markerPopoverCard?.closest?.(".detail-inspector")) return;
   const cardWidth = Math.min(540, Math.max(280, window.innerWidth - 24));
   markerPopoverCard.style.width = `${cardWidth}px`;
 
@@ -1392,6 +1305,86 @@ function queueTimelineFullDomain(data) {
   return domainFromPoints(points) || timelineFullDomain(data);
 }
 
+function normalizeQueueTimelineWindow(start, end, data) {
+  const full = queueTimelineFullDomain(data);
+  const fullMs = Math.max(1, full.end - full.start);
+  const minMs = Math.min(fullMs, MIN_TIMELINE_WINDOW_MS);
+  let windowMs = Math.max(minMs, Math.min(fullMs, end - start || fullMs));
+  let nextStart = Number.isFinite(start) ? start : full.start;
+  let nextEnd = nextStart + windowMs;
+
+  if (nextEnd > full.end) {
+    nextEnd = full.end;
+    nextStart = nextEnd - windowMs;
+  }
+  if (nextStart < full.start) {
+    nextStart = full.start;
+    nextEnd = nextStart + windowMs;
+  }
+
+  return { start: nextStart, end: nextEnd };
+}
+
+function getQueueTimelineView(data) {
+  if (!queueTimelineView) {
+    queueTimelineView = queueTimelineFullDomain(data);
+  }
+  queueTimelineView = normalizeQueueTimelineWindow(queueTimelineView.start, queueTimelineView.end, data);
+  return queueTimelineView;
+}
+
+function setQueueTimelineWindow(start, end) {
+  if (!currentData) return;
+  queueTimelineView = normalizeQueueTimelineWindow(start, end, currentData);
+  renderQueueTimeline(currentData);
+}
+
+function resetQueueTimeline() {
+  if (!currentData) return;
+  queueTimelineView = queueTimelineFullDomain(currentData);
+  renderQueueTimeline(currentData);
+}
+
+function zoomQueueTimeline(factor) {
+  if (!currentData) return;
+  const view = getQueueTimelineView(currentData);
+  const center = view.start + (view.end - view.start) / 2;
+  const nextSpan = (view.end - view.start) * factor;
+  setQueueTimelineWindow(center - nextSpan / 2, center + nextSpan / 2);
+}
+
+function panQueueTimeline(fraction) {
+  if (!currentData) return;
+  const view = getQueueTimelineView(currentData);
+  const shift = (view.end - view.start) * fraction;
+  setQueueTimelineWindow(view.start + shift, view.end + shift);
+}
+
+function queueTimelineIsFull(data) {
+  const view = getQueueTimelineView(data);
+  const full = queueTimelineFullDomain(data);
+  return Math.abs(view.start - full.start) < 1 && Math.abs(view.end - full.end) < 1;
+}
+
+function updateQueueTimelineControls(data) {
+  if (!queueTimelineReadout) return;
+  const view = getQueueTimelineView(data);
+  const full = queueTimelineFullDomain(data);
+  const viewMs = view.end - view.start;
+  const fullMs = full.end - full.start;
+  const minMs = Math.min(fullMs, MIN_TIMELINE_WINDOW_MS);
+  const isFull = queueTimelineIsFull(data);
+
+  queueTimelineReadout.textContent = isFull
+    ? `Full range: ${fmtDuration(fullMs)}`
+    : `${fmtDuration(viewMs)} window: ${fmtDateTime(view.start)} to ${fmtDateTime(view.end)}`;
+  if (queueTimelineZoomOut) queueTimelineZoomOut.disabled = isFull;
+  if (queueTimelineReset) queueTimelineReset.disabled = isFull;
+  if (queueTimelineZoomIn) queueTimelineZoomIn.disabled = viewMs <= minMs + 1;
+  if (queueTimelinePanLeft) queueTimelinePanLeft.disabled = view.start <= full.start + 1;
+  if (queueTimelinePanRight) queueTimelinePanRight.disabled = view.end >= full.end - 1;
+}
+
 function normalizeTimelineWindow(start, end, data) {
   const full = timelineFullDomain(data);
   const fullMs = Math.max(1, full.end - full.start);
@@ -1447,6 +1440,18 @@ function resetTimeline() {
   timelineView = timelineFullDomain(currentData);
   renderTimeline(currentData);
   updateTimelineControls(currentData);
+}
+
+function focusActiveSpan() {
+  if (!currentData) return false;
+  const active = activeSpansForData(currentData);
+  if (!active.length) return false;
+  const newest = active[active.length - 1];
+  const full = timelineFullDomain(currentData);
+  const center = newest.start + Math.max(1, newest.durationMs || 1) / 2;
+  const windowMs = Math.min(full.end - full.start, Math.max(MIN_TIMELINE_WINDOW_MS, (newest.durationMs || 0) * 3));
+  setTimelineWindow(center - windowMs / 2, center + windowMs / 2);
+  return true;
 }
 
 function timelineIsFull(data) {
@@ -1514,6 +1519,172 @@ function svgXToTime(x, svg) {
   const clampedX = clamp(x, plot.left, plot.right);
   const fraction = (clampedX - plot.left) / Math.max(1, plot.right - plot.left);
   return plot.domainStart + fraction * (plot.domainEnd - plot.domainStart);
+}
+
+function minimapSvg() {
+  return timelineMinimap?.querySelector(".minimap-svg");
+}
+
+function minimapPlotFromSvg(svg) {
+  return {
+    domainStart: Number(svg.dataset.domainStart),
+    domainEnd: Number(svg.dataset.domainEnd),
+    left: Number(svg.dataset.plotLeft),
+    right: Number(svg.dataset.plotRight),
+  };
+}
+
+function minimapXToTime(x, svg) {
+  const plot = minimapPlotFromSvg(svg);
+  const clampedX = clamp(x, plot.left, plot.right);
+  const fraction = (clampedX - plot.left) / Math.max(1, plot.right - plot.left);
+  return plot.domainStart + fraction * (plot.domainEnd - plot.domainStart);
+}
+
+function minimapTimeToX(ms, svg) {
+  const plot = minimapPlotFromSvg(svg);
+  const fraction = (ms - plot.domainStart) / Math.max(1, plot.domainEnd - plot.domainStart);
+  return plot.left + fraction * (plot.right - plot.left);
+}
+
+function minimapSelectionRange(svg) {
+  const selection = svg.querySelector(".minimap-selection");
+  const x = Number(selection?.getAttribute("x"));
+  const width = Number(selection?.getAttribute("width"));
+  if (Number.isFinite(x) && Number.isFinite(width)) {
+    return {
+      startX: x,
+      endX: x + width,
+      width,
+    };
+  }
+
+  const plot = minimapPlotFromSvg(svg);
+  const view = currentData ? getTimelineView(currentData) : { start: plot.domainStart, end: plot.domainEnd };
+  const startX = minimapTimeToX(view.start, svg);
+  const endX = minimapTimeToX(view.end, svg);
+  return {
+    startX,
+    endX,
+    width: Math.max(0, endX - startX),
+  };
+}
+
+function minimapDragMode(startX, range) {
+  const nearStart = Math.abs(startX - range.startX) <= MINIMAP_HANDLE_HIT_PX;
+  const nearEnd = Math.abs(startX - range.endX) <= MINIMAP_HANDLE_HIT_PX;
+
+  if (nearStart && nearEnd) {
+    return Math.abs(startX - range.startX) <= Math.abs(startX - range.endX)
+      ? "resize-start"
+      : "resize-end";
+  }
+  if (nearStart) return "resize-start";
+  if (nearEnd) return "resize-end";
+  if (startX > range.startX && startX < range.endX) return "pan";
+  return "select";
+}
+
+function setMinimapDragClasses(mode = "") {
+  if (!timelineMinimap) return;
+  timelineMinimap.classList.toggle("is-selecting", Boolean(mode));
+  timelineMinimap.classList.toggle("is-resizing", mode === "resize-start" || mode === "resize-end");
+  timelineMinimap.classList.toggle("is-panning", mode === "pan");
+}
+
+function updateMinimapSelectionPreview(svg, startX, endX) {
+  const x1 = Math.min(startX, endX);
+  const x2 = Math.max(startX, endX);
+  const selection = svg.querySelector(".minimap-selection");
+  if (selection) {
+    selection.setAttribute("x", x1.toFixed(2));
+    selection.setAttribute("width", Math.max(4, x2 - x1).toFixed(2));
+  }
+
+  const leftHandle = svg.querySelector(".minimap-handle-left");
+  const rightHandle = svg.querySelector(".minimap-handle-right");
+  const leftHit = svg.querySelector(".minimap-handle-hit-left");
+  const rightHit = svg.querySelector(".minimap-handle-hit-right");
+  leftHandle?.setAttribute("x", (x1 - 3).toFixed(2));
+  rightHandle?.setAttribute("x", (x2 - 3).toFixed(2));
+  leftHit?.setAttribute("x", (x1 - MINIMAP_HANDLE_HIT_PX).toFixed(2));
+  rightHit?.setAttribute("x", (x2 - MINIMAP_HANDLE_HIT_PX).toFixed(2));
+}
+
+function updateMinimapDrag(event) {
+  if (!minimapDrag) return;
+  const { svg, startX, mode, originalStartX, originalEndX } = minimapDrag;
+  const plot = minimapPlotFromSvg(svg);
+  const currentX = clamp(pointerToSvgX(event, svg), plot.left, plot.right);
+  const minWidth = MINIMAP_DRAG_MIN_PX;
+  let previewStartX = Math.min(startX, currentX);
+  let previewEndX = Math.max(startX, currentX);
+
+  if (mode === "resize-start") {
+    previewStartX = clamp(currentX, plot.left, originalEndX - minWidth);
+    previewEndX = originalEndX;
+  } else if (mode === "resize-end") {
+    previewStartX = originalStartX;
+    previewEndX = clamp(currentX, originalStartX + minWidth, plot.right);
+  } else if (mode === "pan") {
+    const width = Math.max(minWidth, originalEndX - originalStartX);
+    const nextStartX = clamp(originalStartX + (currentX - startX), plot.left, plot.right - width);
+    previewStartX = nextStartX;
+    previewEndX = nextStartX + width;
+  }
+
+  minimapDrag.currentX = currentX;
+  minimapDrag.previewStartX = previewStartX;
+  minimapDrag.previewEndX = previewEndX;
+  updateMinimapSelectionPreview(svg, previewStartX, previewEndX);
+}
+
+function startMinimapDrag(event) {
+  if (!currentData || event.button !== 0) return;
+  const svg = event.target.closest?.(".minimap-svg");
+  if (!svg) return;
+  const plot = minimapPlotFromSvg(svg);
+  const startX = clamp(pointerToSvgX(event, svg), plot.left, plot.right);
+  const range = minimapSelectionRange(svg);
+  const mode = minimapDragMode(startX, range);
+  event.preventDefault();
+  svg.setPointerCapture?.(event.pointerId);
+  minimapDrag = {
+    pointerId: event.pointerId,
+    svg,
+    mode,
+    startX,
+    currentX: startX,
+    originalStartX: range.startX,
+    originalEndX: range.endX,
+    previewStartX: range.startX,
+    previewEndX: range.endX,
+  };
+  setMinimapDragClasses(mode);
+  updateMinimapDrag(event);
+}
+
+function moveMinimapDrag(event) {
+  if (!minimapDrag || event.pointerId !== minimapDrag.pointerId) return;
+  event.preventDefault();
+  updateMinimapDrag(event);
+}
+
+function finishMinimapDrag(event) {
+  if (!minimapDrag || event.pointerId !== minimapDrag.pointerId) return;
+  event.preventDefault();
+  const { svg, mode, previewStartX, previewEndX } = minimapDrag;
+  svg.releasePointerCapture?.(event.pointerId);
+  setMinimapDragClasses("");
+  minimapDrag = null;
+  const width = Math.abs(previewEndX - previewStartX);
+  if (mode === "select" && width < MINIMAP_DRAG_MIN_PX) {
+    if (currentData) renderTimelineMinimap(currentData);
+    return;
+  }
+  const start = minimapXToTime(previewStartX, svg);
+  const end = minimapXToTime(previewEndX, svg);
+  setTimelineWindow(start, end);
 }
 
 function getSelectionRect(svg) {
@@ -1599,8 +1770,85 @@ function finishTimelineDrag(event) {
   }
 }
 
+function queueTimelineSvg() {
+  return queueTimelineWrap?.querySelector(".queue-timeline-svg");
+}
+
+function updateQueueTimelineDrag(event) {
+  if (!queueTimelineDrag) return;
+  const { svg, startX } = queueTimelineDrag;
+  const plot = timelinePlotFromSvg(svg);
+  const currentX = clamp(pointerToSvgX(event, svg), plot.left, plot.right);
+  queueTimelineDrag.currentX = currentX;
+
+  const x1 = Math.min(startX, currentX);
+  const x2 = Math.max(startX, currentX);
+  const rect = getSelectionRect(svg);
+  rect.setAttribute("x", x1.toFixed(2));
+  rect.setAttribute("y", plot.top.toFixed(2));
+  rect.setAttribute("width", Math.max(1, x2 - x1).toFixed(2));
+  rect.setAttribute("height", Math.max(1, plot.bottom - plot.top).toFixed(2));
+
+  const startTime = svgXToTime(x1, svg);
+  const endTime = svgXToTime(x2, svg);
+  if (queueTimelineReadout) {
+    queueTimelineReadout.textContent =
+      `${fmtDuration(endTime - startTime)} selection: ${fmtDateTime(startTime)} to ${fmtDateTime(endTime)}`;
+  }
+}
+
+function clearQueueTimelineDrag() {
+  const rect = queueTimelineSvg()?.querySelector(".timeline-selection");
+  if (rect) rect.remove();
+  queueTimelineWrap?.classList.remove("is-selecting");
+  queueTimelineDrag = null;
+}
+
+function startQueueTimelineDrag(event) {
+  if (!currentData || event.button !== 0) return;
+  if (event.target.closest?.(".queue-clickable, .queue-activity-clickable, .queue-lane-clickable")) return;
+  const svg = event.target.closest?.(".queue-timeline-svg");
+  if (!svg) return;
+  const plot = timelinePlotFromSvg(svg);
+  const startX = pointerToSvgX(event, svg);
+  if (startX < plot.left || startX > plot.right) return;
+
+  event.preventDefault();
+  svg.setPointerCapture?.(event.pointerId);
+  queueTimelineWrap?.classList.add("is-selecting");
+  queueTimelineDrag = {
+    pointerId: event.pointerId,
+    svg,
+    startX: clamp(startX, plot.left, plot.right),
+    currentX: clamp(startX, plot.left, plot.right),
+  };
+  updateQueueTimelineDrag(event);
+}
+
+function moveQueueTimelineDrag(event) {
+  if (!queueTimelineDrag || event.pointerId !== queueTimelineDrag.pointerId) return;
+  event.preventDefault();
+  updateQueueTimelineDrag(event);
+}
+
+function finishQueueTimelineDrag(event) {
+  if (!queueTimelineDrag || event.pointerId !== queueTimelineDrag.pointerId) return;
+  event.preventDefault();
+  const { svg, startX, currentX } = queueTimelineDrag;
+  const width = Math.abs(currentX - startX);
+  const startTime = svgXToTime(Math.min(startX, currentX), svg);
+  const endTime = svgXToTime(Math.max(startX, currentX), svg);
+  svg.releasePointerCapture?.(event.pointerId);
+  clearQueueTimelineDrag();
+
+  if (width >= DRAG_ZOOM_MIN_PX && endTime > startTime) {
+    setQueueTimelineWindow(startTime, endTime);
+  } else if (currentData) {
+    updateQueueTimelineControls(currentData);
+  }
+}
+
 function renderTimeline(data) {
-  closeMarkerPopover();
   markerLookup = new Map();
   spanLookup = new Map();
   laneLookup = new Map();
@@ -1626,21 +1874,17 @@ function renderTimeline(data) {
     kind: "session",
     session: data.session,
   });
-  for (const child of data.subagents || []) {
+  for (const child of timelineChildRows(data)) {
     const display = childSessionDisplay(child);
-    const labelKind =
-      display.lanePrefix === "app worker"
-        ? "app-worker"
-        : display.lanePrefix === "queue worker"
-          ? "queue-worker"
-          : display.lanePrefix === "agent job"
-            ? "agent-job"
-            : "";
+    const depth = Math.max(1, Number(child.depth || 1));
+    const parentLabel = child.parentSessionLabel || child.parentSessionId || "";
+    const nestedPrefix = depth > 1 && parentLabel ? `via ${parentLabel}: ` : "";
     lanes.push({
-      label: `${display.lanePrefix}: ${display.name}`,
-      labelKind,
+      label: `${nestedPrefix}${display.lanePrefix}: ${display.name}`,
       kind: "session",
       session: child,
+      depth,
+      labelKind: depth > 1 ? "nested-agent" : "",
     });
   }
   for (const thread of data.appThreads || []) {
@@ -1668,7 +1912,7 @@ function renderTimeline(data) {
     .map((lane, index) => {
       const y = top + axisH + index * laneH;
       const label = laneLabelForDisplay(lane, left);
-      const labelClass = lane.labelKind === "app-worker" ? "lane-label-compact" : "";
+      const labelClass = lane.labelKind === "app-worker" || lane.labelKind === "nested-agent" ? "lane-label-compact" : "";
       const laneId =
         lane.kind === "session" &&
         (isAgentJobSession(lane.session) || isAppThreadSession(lane.session))
@@ -1681,7 +1925,7 @@ function renderTimeline(data) {
         });
       }
       let content = `
-        ${laneLabelText(label, laneId, y + 19, labelClass, lane.label)}
+        ${laneLabelText(label, laneId, y + 19, labelClass, lane.label, 10 + Math.max(0, Number(lane.depth || 0) - 1) * 16)}
         <line class="lane-line" x1="${left}" y1="${y + 14}" x2="${width - right}" y2="${y + 14}" />
       `;
 
@@ -1700,31 +1944,35 @@ function renderTimeline(data) {
         }
         const visibleSpans = (session.spans || [])
           .filter((span) => clipRange(span.start, span.end, domainStart, domainEnd))
-          .sort((a, b) => spanPaintRank(a.type) - spanPaintRank(b.type) || a.start - b.start);
+          .filter(shouldShowSpan)
+          .sort((a, b) => spanPaintRank(spanVisualType(a)) - spanPaintRank(spanVisualType(b)) || a.start - b.start);
         for (const span of visibleSpans) {
           const spanRange = clipRange(span.start, span.end, domainStart, domainEnd);
           const spanId = `span-${spanCounter++}`;
           const running = span.active || span.status === "running";
+          const visualType = spanVisualType(span);
           spanLookup.set(spanId, {
             ...span,
             lane: lane.label,
             sessionId: session.id,
             sessionTitle: session.title || "",
           });
-          const spanTitle = `${running ? "Running " : ""}${spanKindLabel(span.type)}: ${span.label}, ${fmtDuration(span.durationMs)}${running ? " so far" : ""}${span.exitCode == null ? "" : `, exit ${span.exitCode}`}`;
+          const spanTitle = `${running ? "Running " : ""}${spanKindLabel(visualType)}: ${span.label}, ${fmtDuration(span.durationMs)}${running ? " so far" : ""}${span.exitCode == null ? "" : `, exit ${span.exitCode}`}`;
           content += interactiveRectWithTitle(
             x(spanRange.start),
             y + 7,
             Math.max(2, x(spanRange.end) - x(spanRange.start)),
             14,
-            `${spanClass(span.type)}${running ? " span-running" : ""}`,
+            `${spanClass(visualType)}${running ? " span-running" : ""}`,
             spanTitle,
             spanId,
           );
         }
-        const visibleMarkers = (session.markers || [])
-          .filter((marker) => marker.ts >= domainStart && marker.ts <= domainEnd)
-          .sort((a, b) => markerPaintRank(a.type) - markerPaintRank(b.type) || a.ts - b.ts);
+        const visibleMarkers = shouldShowMarker()
+          ? (session.markers || [])
+              .filter((marker) => marker.ts >= domainStart && marker.ts <= domainEnd)
+              .sort((a, b) => markerPaintRank(a.type) - markerPaintRank(b.type) || a.ts - b.ts)
+          : [];
         for (const marker of visibleMarkers) {
           const markerId = `marker-${markerCounter++}`;
           markerLookup.set(markerId, {
@@ -1758,7 +2006,77 @@ function renderTimeline(data) {
       ${laneEls}
     </svg>
   `;
+  renderTimelineMinimap(data);
   updateTimelineControls(data);
+}
+
+function renderTimelineMinimap(data) {
+  if (!timelineMinimap) return;
+  const sessions = timelineSessionRows(data);
+  const full = timelineFullDomain(data);
+  const view = getTimelineView(data);
+  const width = Math.max(720, timelineMinimap.clientWidth || timelineWrap.clientWidth || 720);
+  const height = 126;
+  const left = 12;
+  const right = 12;
+  const top = 14;
+  const laneGap = 4;
+  const laneH = Math.max(8, Math.min(15, Math.floor((height - 34) / Math.max(1, sessions.length))));
+  const usable = width - left - right;
+  const domainMs = Math.max(1, full.end - full.start);
+  const x = (ms) => left + ((ms - full.start) / domainMs) * usable;
+  const viewX = x(view.start);
+  const viewW = Math.max(8, x(view.end) - viewX);
+
+  const laneEls = sessions
+    .slice(0, 9)
+    .map((session, index) => {
+      const y = top + index * (laneH + laneGap);
+      const spans = (session.spans || [])
+        .filter(shouldShowSpan)
+        .map((span) => {
+          const range = clipRange(span.start, span.end, full.start, full.end);
+          if (!range) return "";
+          return rectWithTitle(
+            x(range.start),
+            y,
+            Math.max(1, x(range.end) - x(range.start)),
+            laneH,
+            `minimap-span ${spanClass(spanVisualType(span))}`,
+            `${spanKindLabel(spanVisualType(span))}: ${span.label || span.name || ""}`,
+          );
+        })
+        .join("");
+      const markers = shouldShowMarker()
+        ? (session.markers || [])
+            .filter((marker) => marker.ts >= full.start && marker.ts <= full.end)
+            .map((marker) => `<circle class="minimap-marker" cx="${x(marker.ts).toFixed(2)}" cy="${(y + laneH / 2).toFixed(2)}" r="1.6" fill="${markerColor(marker.type)}"></circle>`)
+            .join("")
+        : "";
+      return `<g>${spans}${markers}</g>`;
+    })
+    .join("");
+
+  timelineMinimap.innerHTML = `
+    <svg
+      class="minimap-svg"
+      viewBox="0 0 ${width} ${height}"
+      role="img"
+      aria-label="Timeline overview brush"
+      data-domain-start="${full.start}"
+      data-domain-end="${full.end}"
+      data-plot-left="${left}"
+      data-plot-right="${width - right}"
+    >
+      <rect class="minimap-bg" x="${left}" y="8" width="${usable}" height="${height - 16}" rx="7"></rect>
+      ${laneEls}
+      <rect class="minimap-selection" x="${viewX.toFixed(2)}" y="8" width="${viewW.toFixed(2)}" height="${height - 16}" rx="7"></rect>
+      <rect class="minimap-handle-hit minimap-handle-hit-left" x="${(viewX - MINIMAP_HANDLE_HIT_PX).toFixed(2)}" y="8" width="${MINIMAP_HANDLE_HIT_PX * 2}" height="${height - 16}"></rect>
+      <rect class="minimap-handle-hit minimap-handle-hit-right" x="${(viewX + viewW - MINIMAP_HANDLE_HIT_PX).toFixed(2)}" y="8" width="${MINIMAP_HANDLE_HIT_PX * 2}" height="${height - 16}"></rect>
+      <rect class="minimap-handle minimap-handle-left" x="${(viewX - 3).toFixed(2)}" y="${height / 2 - 18}" width="6" height="36" rx="3"></rect>
+      <rect class="minimap-handle minimap-handle-right" x="${(viewX + viewW - 3).toFixed(2)}" y="${height / 2 - 18}" width="6" height="36" rx="3"></rect>
+    </svg>
+  `;
 }
 
 function queueKey(namespace, queueName) {
@@ -1843,9 +2161,87 @@ function openQueueItemPopover(item, target) {
   );
 }
 
+function queueActivityDetail(activity) {
+  const queue = activity.queue || {};
+  const counts = queue.counts || {};
+  const track = activity.track || {};
+  const bin = activity.bin || null;
+  const displayName = activity.displayName || queueNameForDisplay(queue.name || track.name || "queue");
+  const fullName = activity.fullName || queue.name || track.name || "";
+  const lines = [
+    `Queue: ${displayName}`,
+    fullName && fullName !== displayName ? `Full queue ID: ${fullName}` : "",
+    queue.namespace ? `Namespace: ${queue.namespace}` : "",
+    queue.status ? `Job status: ${queue.status}` : "",
+    queue.source ? `Source: ${queue.source === "codex-security" ? "Codex Security DB" : queue.source}` : "",
+    queue.workerCount != null ? `Workers observed: ${fmtCount(queue.workerCount)}` : "",
+    "",
+    "Totals",
+    `Total items: ${fmtCount(counts.total || track.itemCount || 0)}`,
+    `Completed: ${fmtCount(counts.completed || 0)}`,
+    `Leased: ${fmtCount(counts.leased || 0)}`,
+    `Queued: ${fmtCount(counts.queued || 0)}`,
+    `Failed: ${fmtCount(counts.failed || 0)}`,
+    counts.cancelled ? `Cancelled: ${fmtCount(counts.cancelled)}` : "",
+    queue.sampleRowsLoaded != null ? `Detailed samples loaded: ${fmtCount(queue.sampleRowsLoaded)}` : "",
+    track.itemCount != null ? `Timeline samples aggregated: ${fmtCount(track.itemCount)}` : "",
+    "",
+    "What this row shows",
+    "Each bar segment is an aggregate time bucket from sampled queue-item lifetimes. Darker segments mean more queue items were active in that bucket relative to this queue's busiest bucket.",
+  ];
+
+  if (bin) {
+    lines.push(
+      "",
+      "Selected bucket",
+      `${fmtDateTime(bin.start)} to ${fmtDateTime(bin.end)}`,
+      `Duration: ${fmtDuration(Math.max(0, (bin.end || 0) - (bin.start || 0)))}`,
+      `Active sampled items: ${fmtCount(bin.total || 0)}`,
+      `Completed in/through bucket: ${fmtCount(bin.completed || 0)}`,
+      `Leased in/through bucket: ${fmtCount(bin.leased || 0)}`,
+      `Queued in/through bucket: ${fmtCount(bin.queued || 0)}`,
+      `Failed in/through bucket: ${fmtCount(bin.failed || 0)}`,
+      `Dominant state: ${dominantQueueStatus(bin)}`,
+    );
+  } else {
+    lines.push(
+      "",
+      "Track range",
+      track.start ? `First sampled activity: ${fmtDateTime(track.start)}` : "",
+      track.end ? `Last sampled activity: ${fmtDateTime(track.end)}` : "",
+      track.maxBinTotal != null ? `Busiest bucket: ${fmtCount(track.maxBinTotal)} active sampled item${track.maxBinTotal === 1 ? "" : "s"}` : "",
+    );
+  }
+
+  return lines.filter(Boolean).join("\n");
+}
+
+function openQueueActivityPopover(activity, target) {
+  if (!activity) return;
+  const queue = activity.queue || {};
+  const track = activity.track || {};
+  const bin = activity.bin || null;
+  const displayName = activity.displayName || queueNameForDisplay(queue.name || track.name || "queue");
+  openDetailPopover(
+    {
+      kicker: bin ? "Queue bucket" : "Queue workload",
+      title: displayName,
+      meta: [
+        bin ? `${fmtDateTime(bin.start)} - ${fmtDateTime(bin.end)}` : "",
+        bin ? `${fmtCount(bin.total || 0)} active samples` : `${fmtCount(queue.counts?.total || track.itemCount || 0)} total items`,
+        queue.workerCount ? `${fmtCount(queue.workerCount)} workers` : "",
+      ],
+      body: queueActivityDetail(activity),
+    },
+    target,
+  );
+}
+
 function renderQueueTimeline(data) {
   if (!queueTimelineCard || !queueTimelineWrap || !queueTimelineCaption) return;
   queueItemLookup = new Map();
+  queueActivityLookup = new Map();
+  queueLaneLookup = new Map();
   const queue = data.queue || {};
   const queues = queue.queues || [];
   const items = queue.items || [];
@@ -1863,7 +2259,7 @@ function renderQueueTimeline(data) {
   const laneH = 30;
   const axisH = 28;
   const usable = width - left - right;
-  const view = queueTimelineFullDomain(data);
+  const view = getQueueTimelineView(data);
   const domainStart = view.start;
   const domainEnd = view.end;
   const domainMs = Math.max(1, domainEnd - domainStart);
@@ -1887,12 +2283,15 @@ function renderQueueTimeline(data) {
   const lanes = [];
   for (const q of [...queueByKey.values()].sort((a, b) => a.name.localeCompare(b.name))) {
     const track = trackByQueue.get(queueKey(q.namespace, q.name));
+    const displayName = queueNameForDisplay(q.name);
     if (track) {
       lanes.push({
-        label: `throughput: ${q.name}`,
+        label: `queue: ${displayName}`,
         kind: "queueActivity",
         queue: q,
         track,
+        displayName,
+        fullName: q.name,
         labelKind: "queue-activity",
       });
     }
@@ -1919,7 +2318,8 @@ function renderQueueTimeline(data) {
     queue.timelineRowsLoaded || tracks.reduce((sum, track) => sum + (track.itemCount || 0), 0);
   queueTimelineCaption.textContent = [
     `Shows when queue work happened, so you can compare worker throughput against parent waits and spot idle gaps.`,
-    `Each throughput row is an aggregate heatmap from ${fmtCount(timelineRowsLoaded)}${queue.timelineTruncated ? "+" : ""} sampled item lifetime${timelineRowsLoaded === 1 ? "" : "s"} across ${fmtCount(tracks.length || queueByKey.size)} queue${(tracks.length || queueByKey.size) === 1 ? "" : "s"}.`,
+    `Click a queue row or heatmap segment for counts and meaning; drag empty chart space to zoom into a time range.`,
+    `Each queue row is an aggregate heatmap from ${fmtCount(timelineRowsLoaded)}${queue.timelineTruncated ? "+" : ""} sampled item lifetime${timelineRowsLoaded === 1 ? "" : "s"} across ${fmtCount(tracks.length || queueByKey.size)} queue${(tracks.length || queueByKey.size) === 1 ? "" : "s"}.`,
     visibleSamples.length > itemLimit
       ? `Showing ${fmtCount(itemLimit)} of ${fmtCount(visibleSamples.length)} active/problem item rows.`
       : visibleSamples.length
@@ -1929,6 +2329,8 @@ function renderQueueTimeline(data) {
 
   const height = top + axisH + lanes.length * laneH + 18;
   let queueItemCounter = 0;
+  let queueActivityCounter = 0;
+  let queueLaneCounter = 0;
   const ticks = 6;
   const tickEls = Array.from({ length: ticks + 1 }, (_, i) => {
     const ms = domainStart + (domainMs / ticks) * i;
@@ -1943,8 +2345,19 @@ function renderQueueTimeline(data) {
     .map((lane, index) => {
       const y = top + axisH + index * laneH;
       const label = laneLabelForDisplay(lane, left);
+      const laneId = lane.kind === "queueActivity" ? `queue-lane-${queueLaneCounter++}` : "";
+      if (laneId) {
+        queueLaneLookup.set(laneId, {
+          queue: lane.queue,
+          track: lane.track,
+          displayName: lane.displayName,
+          fullName: lane.fullName,
+        });
+      }
       let content = `
-        ${laneLabelText(label, "", y + 19, lane.labelKind ? "lane-label-compact" : "", lane.label)}
+        ${lane.kind === "queueActivity"
+          ? queueLaneLabelText(label, laneId, y + 19, lane.labelKind ? "lane-label-compact" : "", lane.label)
+          : laneLabelText(label, "", y + 19, lane.labelKind ? "lane-label-compact" : "", lane.label)}
         <line class="lane-line" x1="${left}" y1="${y + 14}" x2="${width - right}" y2="${y + 14}" />
       `;
 
@@ -1956,13 +2369,22 @@ function renderQueueTimeline(data) {
           const status = dominantQueueStatus(bin);
           const density = clamp((bin.total || 0) / Math.max(1, track.maxBinTotal || 1), 0, 1);
           const opacity = (0.18 + density * 0.74).toFixed(2);
-          content += rectWithTitleAttrs(
+          const activityId = `queue-activity-${queueActivityCounter++}`;
+          queueActivityLookup.set(activityId, {
+            queue: lane.queue,
+            track,
+            bin,
+            displayName: lane.displayName,
+            fullName: lane.fullName,
+          });
+          content += interactiveQueueActivityRectWithTitle(
             x(binRange.start),
             y + 8,
             Math.max(1, x(binRange.end) - x(binRange.start)),
             12,
             `${spanClass(status)} queue-density-bin`,
-            queueBinTitle(track.name, bin),
+            queueBinTitle(lane.displayName || track.name, bin),
+            activityId,
             `opacity="${opacity}"`,
           );
         }
@@ -1992,11 +2414,18 @@ function renderQueueTimeline(data) {
       viewBox="0 0 ${width} ${height}"
       role="img"
       aria-label="Queue workload timeline"
+      data-domain-start="${domainStart}"
+      data-domain-end="${domainEnd}"
+      data-plot-left="${left}"
+      data-plot-right="${width - right}"
+      data-select-top="18"
+      data-select-bottom="${height - 10}"
     >
       ${tickEls}
       ${laneEls}
     </svg>
   `;
+  updateQueueTimelineControls(data);
   queueTimelineCard.hidden = false;
 }
 
@@ -2016,10 +2445,7 @@ function ellipsizeMiddle(value, max) {
 }
 
 function laneLabelForDisplay(lane, left) {
-  const isCompactWorker =
-    lane.labelKind === "app-worker" ||
-    lane.labelKind === "queue-worker" ||
-    lane.labelKind === "agent-job";
+  const isCompactWorker = lane.labelKind === "app-worker" || lane.labelKind === "queue-worker";
   const max = isCompactWorker
     ? (left >= 300 ? 48 : 40)
     : (left >= 300 ? 52 : 44);
@@ -2027,22 +2453,22 @@ function laneLabelForDisplay(lane, left) {
 
   if (!isCompactWorker) return ellipsizeEnd(label, max);
 
-  const prefixMatch = label.match(/^((?:(?:app|queue) (?:worker|thread)|agent job):\s*)(.+)$/);
+  const prefixMatch = label.match(/^((?:app|queue) (?:worker|thread):\s*)(.+)$/);
   if (!prefixMatch) return ellipsizeMiddle(label, max);
   const [, prefix, name] = prefixMatch;
   return `${prefix}${ellipsizeMiddle(name, Math.max(12, max - prefix.length))}`;
 }
 
-function laneLabelText(label, laneId, y, extraClass = "", fullLabel = label) {
+function laneLabelText(label, laneId, y, extraClass = "", fullLabel = label, x = 10) {
   const className = ["lane-label", extraClass].filter(Boolean).join(" ");
   if (!laneId) {
-    return `<text class="${esc(className)}" x="10" y="${y}">${esc(label)}<title>${esc(fullLabel)}</title></text>`;
+    return `<text class="${esc(className)}" x="${x}" y="${y}">${esc(label)}<title>${esc(fullLabel)}</title></text>`;
   }
 
   return `
     <text
       class="${esc(`${className} lane-clickable`)}"
-      x="10"
+      x="${x}"
       y="${y}"
       data-lane-id="${esc(laneId)}"
       tabindex="0"
@@ -2052,6 +2478,25 @@ function laneLabelText(label, laneId, y, extraClass = "", fullLabel = label) {
     >
       ${esc(label)}
       <title>${esc(`${fullLabel}. Click for task summary.`)}</title>
+    </text>
+  `;
+}
+
+function queueLaneLabelText(label, laneId, y, extraClass = "", fullLabel = label, x = 10) {
+  const className = ["lane-label", extraClass, "queue-lane-clickable"].filter(Boolean).join(" ");
+  return `
+    <text
+      class="${esc(`${className} lane-clickable`)}"
+      x="${x}"
+      y="${y}"
+      data-queue-lane-id="${esc(laneId)}"
+      tabindex="0"
+      focusable="true"
+      role="button"
+      aria-label="${esc(`${fullLabel}. Click for queue workload summary.`)}"
+    >
+      ${esc(label)}
+      <title>${esc(`${fullLabel}. Click for queue workload summary.`)}</title>
     </text>
   `;
 }
@@ -2116,6 +2561,27 @@ function interactiveQueueRectWithTitle(x, y, width, height, className, title, it
       aria-label="${esc(`${title}. Click for details.`)}"
     >
       <title>${esc(`${title}. Click for details.`)}</title>
+    </rect>
+  `;
+}
+
+function interactiveQueueActivityRectWithTitle(x, y, width, height, className, title, activityId, attrs = "") {
+  return `
+    <rect
+      class="${className} queue-activity-clickable"
+      x="${Number(x).toFixed(2)}"
+      y="${y}"
+      width="${Number(width).toFixed(2)}"
+      height="${height}"
+      rx="4"
+      data-queue-activity-id="${esc(activityId)}"
+      tabindex="0"
+      focusable="true"
+      role="button"
+      aria-label="${esc(`${title}. Click for queue workload details.`)}"
+      ${attrs}
+    >
+      <title>${esc(`${title}. Click for queue workload details.`)}</title>
     </rect>
   `;
 }
@@ -2237,6 +2703,7 @@ function markerShape(marker, markerId, cx, cy, title) {
 }
 
 function renderSubagents(children, activeLeases) {
+  if (!subagentsPanel || !subagentTable) return;
   if (!children.length) {
     subagentsPanel.hidden = true;
     return;
@@ -2288,26 +2755,20 @@ function renderSubagents(children, activeLeases) {
 }
 
 function renderQueues(queue) {
-  const linkedRows = queue.queues || [];
-  const diagnosticRows = queue.unlinkedQueues || [];
-  const rows = [...linkedRows, ...diagnosticRows].sort(queueSortForVisibility);
-  if (!rows.length && !queue.itemRowsTotal && !(queue.items || []).length) {
+  if (!(queue.queues || []).length && !queue.itemRowsTotal && !(queue.items || []).length) {
     queuesPanel.hidden = true;
     return;
   }
   const totalItems = queue.itemRowsTotal || queue.stats?.total || (queue.items || []).length;
   const detailRows = queue.itemRowsLoaded || (queue.items || []).length;
   const timelineRows = queue.timelineRowsLoaded || 0;
-  const diagnosticTotal = diagnosticRows.reduce((sum, item) => sum + Number(item.counts?.total || 0), 0);
-  const hasCancelled = rows.some((q) => q.counts?.cancelled);
+  const hasCancelled = (queue.queues || []).some((q) => q.counts?.cancelled);
   queueTable.innerHTML = `
     <table>
       <thead>
         <tr>
           <th>Queue</th>
-          <th>Status</th>
-          <th>Link</th>
-          <th>Source</th>
+          <th>Namespace</th>
           <th class="num">Queued</th>
           <th class="num">Leased</th>
           <th class="num">Done</th>
@@ -2316,13 +2777,11 @@ function renderQueues(queue) {
         </tr>
       </thead>
       <tbody>
-        ${rows
+        ${(queue.queues || [])
           .map((q) => `
-            <tr class="${q.diagnosticReason ? "queue-table-diagnostic" : ""}">
-              <td title="${esc([q.namespace, q.dbPath].filter(Boolean).join("\n"))}">${esc(q.name)}</td>
-              <td>${esc(q.status || "")}</td>
-              <td>${esc(queueLinkLabel(q) || "")}</td>
-              <td>${esc(queueSourceLabel(q))}</td>
+            <tr>
+              <td title="${esc(q.name)}">${esc(queueDisplayName(q))}</td>
+              <td title="${esc(q.namespace)}">${esc(shortNamespace(q.namespace))}</td>
               <td class="num">${q.counts.queued || 0}</td>
               <td class="num">${q.counts.leased || 0}</td>
               <td class="num">${q.counts.completed || 0}</td>
@@ -2337,7 +2796,6 @@ function renderQueues(queue) {
       ${fmtCount(totalItems)} total item rows counted from ${esc(queue.dbPath)}.
       ${fmtCount(detailRows)} detailed sample row${detailRows === 1 ? "" : "s"} loaded${queue.truncated ? " (sample capped)" : ""};
       ${fmtCount(timelineRows)} timeline row${timelineRows === 1 ? "" : "s"} aggregated${queue.timelineTruncated ? " (timeline capped)" : ""}.
-      ${diagnosticRows.length ? `${fmtCount(diagnosticTotal)} diagnostic item${diagnosticTotal === 1 ? "" : "s"} shown separately.` : ""}
     </p>
   `;
   queuesPanel.hidden = false;
@@ -2385,6 +2843,20 @@ function queueItemTargetFromEvent(event) {
   if (!itemEl || !queueTimelineWrap?.contains(itemEl)) return null;
   const item = queueItemLookup.get(itemEl.dataset.queueItemId);
   return item ? { itemEl, item } : null;
+}
+
+function queueActivityTargetFromEvent(event) {
+  const activityEl = event.target.closest?.(".queue-activity-clickable");
+  if (!activityEl || !queueTimelineWrap?.contains(activityEl)) return null;
+  const activity = queueActivityLookup.get(activityEl.dataset.queueActivityId);
+  return activity ? { activityEl, activity } : null;
+}
+
+function queueLaneTargetFromEvent(event) {
+  const laneEl = event.target.closest?.(".queue-lane-clickable");
+  if (!laneEl || !queueTimelineWrap?.contains(laneEl)) return null;
+  const activity = queueLaneLookup.get(laneEl.dataset.queueLaneId);
+  return activity ? { laneEl, activity } : null;
 }
 
 form.addEventListener("submit", async (event) => {
@@ -2446,6 +2918,15 @@ document.addEventListener("pointerdown", (event) => {
 
 timelineTab?.addEventListener("click", () => setActiveView("timeline"));
 queuesTab?.addEventListener("click", () => setActiveView("queues"));
+for (const checkbox of [filterEvents, filterTools, filterWaits, filterSpawns]) {
+  checkbox?.addEventListener("change", () => {
+    if (!currentData) return;
+    renderTimeline(currentData);
+    if (activeView === "queues") renderQueueTimeline(currentData);
+  });
+}
+exportSessionButton?.addEventListener("click", exportCurrentSession);
+refreshSessionButton?.addEventListener("click", refreshCurrentSession);
 queueRefreshButton?.addEventListener("click", () => refreshQueuesOnly());
 queueAutoRefresh?.addEventListener("change", () => setQueueAutoRefresh(queueAutoRefresh.checked));
 
@@ -2454,8 +2935,17 @@ timelineZoomOut.addEventListener("click", () => zoomTimeline(2));
 timelinePanLeft.addEventListener("click", () => panTimeline(-0.5));
 timelinePanRight.addEventListener("click", () => panTimeline(0.5));
 timelineReset.addEventListener("click", resetTimeline);
-loadFullDetailsButton?.addEventListener("click", loadFullDetails);
-loadAllEventsButton?.addEventListener("click", loadAllEvents);
+queueTimelineZoomIn?.addEventListener("click", () => zoomQueueTimeline(0.5));
+queueTimelineZoomOut?.addEventListener("click", () => zoomQueueTimeline(2));
+queueTimelinePanLeft?.addEventListener("click", () => panQueueTimeline(-0.5));
+queueTimelinePanRight?.addEventListener("click", () => panQueueTimeline(0.5));
+queueTimelineReset?.addEventListener("click", resetQueueTimeline);
+timelineNow?.addEventListener("click", () => {
+  if (!focusActiveSpan() && currentData) resetTimeline();
+});
+followActive?.addEventListener("change", () => {
+  if (followActive.checked) focusActiveSpan();
+});
 
 timelineWrap.addEventListener(
   "wheel",
@@ -2512,6 +3002,18 @@ timelineWrap.addEventListener("keydown", (event) => {
 });
 
 queueTimelineWrap?.addEventListener("click", (event) => {
+  const laneTarget = queueLaneTargetFromEvent(event);
+  if (laneTarget) {
+    event.stopPropagation();
+    openQueueActivityPopover(laneTarget.activity, laneTarget.laneEl);
+    return;
+  }
+  const activityTarget = queueActivityTargetFromEvent(event);
+  if (activityTarget) {
+    event.stopPropagation();
+    openQueueActivityPopover(activityTarget.activity, activityTarget.activityEl);
+    return;
+  }
   const itemTarget = queueItemTargetFromEvent(event);
   if (!itemTarget) return;
   event.stopPropagation();
@@ -2519,10 +3021,38 @@ queueTimelineWrap?.addEventListener("click", (event) => {
 });
 queueTimelineWrap?.addEventListener("keydown", (event) => {
   if (event.key !== "Enter" && event.key !== " " && event.key !== "Spacebar") return;
+  const laneTarget = queueLaneTargetFromEvent(event);
+  if (laneTarget) {
+    event.preventDefault();
+    openQueueActivityPopover(laneTarget.activity, laneTarget.laneEl);
+    return;
+  }
+  const activityTarget = queueActivityTargetFromEvent(event);
+  if (activityTarget) {
+    event.preventDefault();
+    openQueueActivityPopover(activityTarget.activity, activityTarget.activityEl);
+    return;
+  }
   const itemTarget = queueItemTargetFromEvent(event);
   if (!itemTarget) return;
   event.preventDefault();
   openQueueItemPopover(itemTarget.item, itemTarget.itemEl);
+});
+queueTimelineWrap?.addEventListener("pointerdown", startQueueTimelineDrag);
+queueTimelineWrap?.addEventListener("pointermove", moveQueueTimelineDrag);
+queueTimelineWrap?.addEventListener("pointerup", finishQueueTimelineDrag);
+queueTimelineWrap?.addEventListener("pointercancel", () => {
+  clearQueueTimelineDrag();
+  if (currentData) updateQueueTimelineControls(currentData);
+});
+
+timelineMinimap?.addEventListener("pointerdown", startMinimapDrag);
+timelineMinimap?.addEventListener("pointermove", moveMinimapDrag);
+timelineMinimap?.addEventListener("pointerup", finishMinimapDrag);
+timelineMinimap?.addEventListener("pointercancel", () => {
+  minimapDrag = null;
+  setMinimapDragClasses("");
+  if (currentData) renderTimelineMinimap(currentData);
 });
 
 markerPopoverClose?.addEventListener("click", closeMarkerPopover);
@@ -2536,6 +3066,7 @@ window.addEventListener("resize", () => {
   if (!currentData) return;
   renderTimeline(currentData);
   renderQueueProgress(currentData.queue || {});
+  if (activeView === "queues") renderQueueTimeline(currentData);
   applyActiveView();
 });
 
