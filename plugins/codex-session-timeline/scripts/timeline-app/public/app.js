@@ -301,12 +301,13 @@ function childSessionDisplay(session) {
   }
 
   if (isAgentJobSession(session)) {
+    const name = agentJobDisplayName(session);
     return {
-      lanePrefix: "agent_job",
-      name: session.id.slice(0, 13),
-      tableName: "agent_job",
+      lanePrefix: "agent job",
+      name,
+      tableName: "agent job",
       tableClass: "pill pill-agent-job",
-      sessionLabel: session.id,
+      sessionLabel: `${name} (${session.id})`,
     };
   }
 
@@ -354,6 +355,25 @@ function agentJobTaskSummary(session) {
   if (!lines.length) lines.push("Task instruction: No user prompt was captured for this child session.");
 
   return lines.join("\n");
+}
+
+function agentJobDisplayName(session) {
+  const prompt = firstMarkerDetail(session, "user");
+  const targetFile = promptField(prompt, "Target file");
+  const batchId = promptField(prompt, "Batch ID");
+  const itemId = promptField(prompt, "Item ID");
+
+  if (targetFile) return `review ${compactPath(targetFile)}`;
+  if (batchId) return `triage ${batchId}`;
+  if (itemId) {
+    const compactItem = compactPath(itemId);
+    if (/^batch[_-]?\d+/i.test(itemId)) return `triage ${compactItem}`;
+    if (/[/.]/.test(itemId)) return `review ${compactItem}`;
+    return `item ${compactItem}`;
+  }
+
+  const job = agentJobId(session);
+  return job ? `job ${job.slice(0, 8)}` : session.id.slice(0, 13);
 }
 
 function appThreadTaskSummary(session) {
