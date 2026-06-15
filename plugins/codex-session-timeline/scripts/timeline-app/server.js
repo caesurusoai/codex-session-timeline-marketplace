@@ -38,6 +38,8 @@ const SQLITE_COPY_DIR = path.join(os.tmpdir(), "codex-session-timeline-sqlite");
 const MAX_RUNNING_DIAGNOSTIC_ITEMS = Number(process.env.MAX_RUNNING_DIAGNOSTIC_ITEMS || 8);
 const MAX_LAUNCHER_EVENT_ROWS = Number(process.env.MAX_LAUNCHER_EVENT_ROWS || 500);
 const MAX_LAUNCHER_WORKER_FILES = Number(process.env.MAX_LAUNCHER_WORKER_FILES || 500);
+const MAX_CHILD_SESSION_DEPTH = Math.max(1, Number(process.env.MAX_CHILD_SESSION_DEPTH || 4) || 4);
+const MAX_CHILD_SESSIONS = Math.max(1, Number(process.env.MAX_CHILD_SESSIONS || 1000) || 1000);
 const COMPACTION_DEDUPE_WINDOW_MS = 100;
 const REMOTE_HOSTS = {
   ...parseRemoteHosts(process.env.CODEX_TIMELINE_REMOTE_HOSTS || ""),
@@ -285,6 +287,117 @@ function findChildSessionFiles(parentId, spawnedIds, codexHome = CODEX_HOME) {
   }
 
   return [...filesById.entries()].map(([id, filePath]) => ({ id, filePath }));
+}
+
+function sessionIdFromFilePath(filePath) {
+  const match = path.basename(filePath).match(/([0-9a-f]{8}-[0-9a-f-]{27,})\.jsonl$/i);
+  return match ? match[1] : "";
+}
+
+function parentThreadIdFromFirstLine(firstLine) {
+  const match = String(firstLine || "").match(/"parent_thread_id":"([^"]+)"/);
+  return match ? match[1] : "";
+}
+
+function localSessionFileRecords(codexHome = CODEX_HOME) {
+  const roots = [
+    path.join(codexHome, "sessions"),
+    path.join(codexHome, "archived_sessions"),
+  ];
+  const records = [];
+
+  for (const root of roots) {
+    walkJsonl(root, (filePath) => {
+      const id = sessionIdFromFilePath(filePath);
+      if (!id) return;
+      let first = "";
+      try {
+        first = readFirstLine(filePath);
+      } catch {
+        // Ignore unreadable rollouts.
+      }
+      records.push({ id, filePath, parentId: parentThreadIdFromFirstLine(first) });
+    });
+  }
+
+  return records;
+}
+
+function indexedLocalSessionRecords(codexHome = CODEX_HOME) {
+  const byId = new Map();
+  for (const record of localSessionFileRecords(codexHome)) {
+    const existing = byId.get(record.id);
+    if (!existing || record.filePath.localeCompare(existing.filePath) > 0) {
+      byId.set(record.id, record);
+    }
+  }
+
+  const byParent = new Map();
+  for (const record of byId.values()) {
+    if (!record.parentId) continue;
+    if (!byParent.has(record.parentId)) byParent.set(record.parentId, []);
+    byParent.get(record.parentId).push(record);
+  }
+  for (const records of byParent.values()) {
+    records.sort((a, b) => a.filePath.localeCompare(b.filePath));
+  }
+
+  return { byId, byParent };
+}
+
+function spawnedChildIds(session) {
+  return (session?.spawned || [])
+    .filter((entry) => entry?.status === "spawned" && entry.id)
+    .map((entry) => entry.id);
+}
+
+function childRecordsForParent(recordIndex, parentId, spawnedIds) {
+  const byFile = new Map();
+  for (const id of spawnedIds || []) {
+    const record = recordIndex.byId.get(id);
+    if (record) byFile.set(record.filePath, record);
+  }
+  for (const record of recordIndex.byParent.get(parentId) || []) {
+    byFile.set(record.filePath, record);
+  }
+  return [...byFile.values()].sort((a, b) => a.filePath.localeCompare(b.filePath));
+}
+
+function parseLocalDescendantSessions(rootParentId, parent, index, codexHome = CODEX_HOME, options = {}) {
+  const recordIndex = indexedLocalSessionRecords(codexHome);
+  const parsedById = new Map();
+  const seenIds = new Set([rootParentId]);
+  const queue = [
+    {
+      parentId: rootParentId,
+      spawnedIds: spawnedChildIds(parent),
+      depth: 1,
+    },
+  ];
+
+  while (queue.length && parsedById.size < MAX_CHILD_SESSIONS) {
+    const current = queue.shift();
+    if (!current || current.depth > MAX_CHILD_SESSION_DEPTH) continue;
+
+    for (const record of childRecordsForParent(recordIndex, current.parentId, current.spawnedIds)) {
+      if (!record.id || seenIds.has(record.id) || parsedById.size >= MAX_CHILD_SESSIONS) continue;
+      seenIds.add(record.id);
+
+      const parsed = parseSessionFile(record.filePath, index.get(record.id), options);
+      parsed.rootParentId = rootParentId;
+      parsed.parentSessionId = childParentId(parsed) || record.parentId || current.parentId;
+      parsed.childDepth = current.depth;
+      parsedById.set(parsed.id, parsed);
+
+      queue.push({
+        parentId: parsed.id,
+        spawnedIds: spawnedChildIds(parsed),
+        depth: current.depth + 1,
+      });
+    }
+  }
+
+  return parsedChildSessions(rootParentId, [...parsedById.values()]);
 }
 
 function toMs(timestamp) {
@@ -1194,6 +1307,14 @@ function collectLauncherHintsFromCall(call, hints, observedAt) {
   );
 }
 
+function codexSecurityQueueHintsFromLauncherHints(hints) {
+  return mergeCodexSecurityQueueHints(
+    [...(hints?.values?.() || [])]
+      .filter((hint) => hint?.dbPath && hint?.jobId)
+      .map((hint) => ({ dbPath: hint.dbPath, jobIds: [hint.jobId] })),
+  );
+}
+
 function launcherMetadataDirs(rootDir) {
   if (!rootDir || !fs.existsSync(rootDir)) return [];
   const limit = Math.max(1, Number(MAX_LAUNCHER_WORKER_FILES) || 500);
@@ -1991,6 +2112,7 @@ function parseSessionRows(rows, filePath, indexEntry, options = {}) {
   const busyMs = unionMs(spans);
   const quietMs = Math.max(0, activeSpanMs - busyMs);
   collectLauncherWorkersFromHints(launcherHints, launcherWorkers);
+  const codexSecurityQueueHints = codexSecurityQueueHintsFromLauncherHints(launcherHints);
 
   return {
     id: meta.id || indexEntry?.id || path.basename(filePath),
@@ -2014,6 +2136,7 @@ function parseSessionRows(rows, filePath, indexEntry, options = {}) {
     markers: normalizedMarkers(markers.filter((m) => m.ts)),
     spawned,
     namespaces: [...namespaces],
+    codexSecurityQueueHints,
     appThreads: mergedAppThreadSessions([
       ...appThreadSessions(appThreads, meta.id || indexEntry?.id || path.basename(filePath)),
       ...launcherWorkerSessions(launcherWorkers, meta.id || indexEntry?.id || path.basename(filePath), options),
@@ -2520,7 +2643,7 @@ function codexSecurityQueueHintsFromParentThread(sessionId, codexHome = CODEX_HO
 function mergeCodexSecurityQueueHints(hints) {
   const byDb = new Map();
   for (const hint of hints || []) {
-    const dbPath = hint?.dbPath || "";
+    const dbPath = canonicalDbPath(hint?.dbPath || "");
     if (!dbPath) continue;
     if (!byDb.has(dbPath)) byDb.set(dbPath, new Set());
     for (const jobId of hint.jobIds || []) {
@@ -2528,6 +2651,16 @@ function mergeCodexSecurityQueueHints(hints) {
     }
   }
   return [...byDb.entries()].map(([dbPath, jobIds]) => ({ dbPath, jobIds: [...jobIds] }));
+}
+
+function canonicalDbPath(dbPath) {
+  if (!dbPath) return "";
+  const resolved = path.resolve(String(dbPath));
+  try {
+    return fs.realpathSync.native(resolved);
+  } catch {
+    return resolved;
+  }
 }
 
 function codexSecurityScanKeyFromDbPath(dbPath) {
@@ -3188,6 +3321,7 @@ function loadQueueDataFromDb(dbPath, sessionId, namespaceHints) {
 function loadQueueData(sessionId, namespaceHints, appThreads = [], codexHome = CODEX_HOME, options = {}) {
   const queueService = loadQueueDataFromDb(QUEUE_DB, sessionId, namespaceHints);
   const codexSecurityHints = mergeCodexSecurityQueueHints([
+    ...(Array.isArray(options.codexSecurityQueueHints) ? options.codexSecurityQueueHints : []),
     ...codexSecurityQueueHintsFromAppThreads(appThreads),
     ...codexSecurityQueueHintsFromParentThread(sessionId, codexHome),
   ]);
@@ -3488,10 +3622,12 @@ function childLastEventSummary(child) {
   return "no transcript event beyond session metadata";
 }
 
-function agentJobGroups(children, callStart, inputValues) {
+function agentJobGroups(children, callStart, inputValues, parentId = "") {
   const inputSet = new Set(inputValues || []);
   const groups = new Map();
   for (const child of children || []) {
+    const actualParentId = childParentId(child) || child.parentSessionId || "";
+    if (parentId && actualParentId && actualParentId !== parentId) continue;
     const jobId = agentJobIdForSession(child);
     if (!jobId) continue;
     const itemId = agentJobItemId(child);
@@ -3573,7 +3709,7 @@ function spawnAgentsCsvDiagnostics(span, parent, children, source) {
   const args = span.args || safeParseJson(span.argsPreview || "{}", {});
   const input = csvInfo(source, args.csv_path, args.id_column);
   const output = csvInfo(source, args.output_csv_path, "");
-  const groups = agentJobGroups(children, span.start, input.values);
+  const groups = agentJobGroups(children, span.start, input.values, parent.id);
   const group = chooseAgentJobGroup(groups);
   const lines = ["spawn_agents_on_csv diagnostics"];
 
@@ -3625,11 +3761,13 @@ function spawnAgentsCsvDiagnostics(span, parent, children, source) {
 }
 
 function augmentRunningToolDiagnostics(parent, children, source) {
-  for (const span of parent.spans || []) {
-    if (!(span.active || span.status === "running")) continue;
-    const diagnostics = spawnAgentsCsvDiagnostics(span, parent, children, source);
-    if (diagnostics) {
-      span.detail = clipSpanDetail([span.detail, diagnostics].filter(Boolean).join("\n\n"));
+  for (const session of [parent, ...(children || [])]) {
+    for (const span of session.spans || []) {
+      if (!(span.active || span.status === "running")) continue;
+      const diagnostics = spawnAgentsCsvDiagnostics(span, session, children, source);
+      if (diagnostics) {
+        span.detail = clipSpanDetail([span.detail, diagnostics].filter(Boolean).join("\n\n"));
+      }
     }
   }
 }
@@ -3799,7 +3937,7 @@ function childParentId(session) {
 
 function isParsedChildSession(parentId, session) {
   if (!session || session.id === parentId) return false;
-  return childParentId(session) === parentId;
+  return childParentId(session) === parentId || session.rootParentId === parentId;
 }
 
 function parsedChildSessions(parentId, sessions) {
@@ -3851,22 +3989,14 @@ function buildLocalSessionPayload(sessionId, codexHome = CODEX_HOME, options = {
   }
 
   const parent = parseSessionFile(sessionFile, index.get(sessionId), options);
-  const childRefs = findChildSessionFiles(
-    sessionId,
-    parent.spawned.filter((s) => s.status === "spawned").map((s) => s.id),
-    codexHome,
-  );
-  const children = parsedChildSessions(
-    sessionId,
-    childRefs.map((child) => parseSessionFile(child.filePath, index.get(child.id), options)),
-  );
+  const children = parseLocalDescendantSessions(sessionId, parent, index, codexHome, options);
 
   const queue = loadQueueData(
     sessionId,
     namespaceHintsFor(parent, children, parent.appThreads || []),
     parent.appThreads || [],
     codexHome,
-    options,
+    { ...options, codexSecurityQueueHints: parent.codexSecurityQueueHints || [] },
   );
   return completeSessionPayload({
     codexHome,

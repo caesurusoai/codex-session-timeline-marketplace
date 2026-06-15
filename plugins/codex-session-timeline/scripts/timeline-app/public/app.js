@@ -170,6 +170,27 @@ function agentJobId(session) {
   return kind.startsWith("agent_job:") ? kind.slice("agent_job:".length) : "";
 }
 
+function agentJobItemId(session) {
+  return promptField(firstMarkerDetail(session, "user"), "Item ID");
+}
+
+function agentJobDisplayName(session) {
+  const itemId = agentJobItemId(session);
+  if (itemId) return itemId;
+  if (session.meta?.agentNickname) return session.meta.agentNickname;
+  if (session.title && session.title !== session.id) return session.title;
+  const job = agentJobId(session);
+  if (job) return `${job.slice(0, 8)} worker`;
+  return session.id.slice(0, 13);
+}
+
+function agentJobSessionLabel(session) {
+  const itemId = agentJobItemId(session);
+  const job = agentJobId(session);
+  if (itemId && job) return `${itemId} (${job})`;
+  return itemId || job || session.id;
+}
+
 function stripUuidPrefix(value) {
   return String(value || "").replace(
     /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}[-_:]*/i,
@@ -257,12 +278,13 @@ function childSessionDisplay(session) {
   }
 
   if (isAgentJobSession(session)) {
+    const name = agentJobDisplayName(session);
     return {
-      lanePrefix: "agent_job",
-      name: session.id.slice(0, 13),
-      tableName: "agent_job",
+      lanePrefix: "agent job",
+      name,
+      tableName: "agent job",
       tableClass: "pill pill-agent-job",
-      sessionLabel: session.id,
+      sessionLabel: agentJobSessionLabel(session),
     };
   }
 
@@ -1606,7 +1628,20 @@ function renderTimeline(data) {
   });
   for (const child of data.subagents || []) {
     const display = childSessionDisplay(child);
-    lanes.push({ label: `${display.lanePrefix}: ${display.name}`, kind: "session", session: child });
+    const labelKind =
+      display.lanePrefix === "app worker"
+        ? "app-worker"
+        : display.lanePrefix === "queue worker"
+          ? "queue-worker"
+          : display.lanePrefix === "agent job"
+            ? "agent-job"
+            : "";
+    lanes.push({
+      label: `${display.lanePrefix}: ${display.name}`,
+      labelKind,
+      kind: "session",
+      session: child,
+    });
   }
   for (const thread of data.appThreads || []) {
     const display = childSessionDisplay(thread);
@@ -1981,7 +2016,10 @@ function ellipsizeMiddle(value, max) {
 }
 
 function laneLabelForDisplay(lane, left) {
-  const isCompactWorker = lane.labelKind === "app-worker" || lane.labelKind === "queue-worker";
+  const isCompactWorker =
+    lane.labelKind === "app-worker" ||
+    lane.labelKind === "queue-worker" ||
+    lane.labelKind === "agent-job";
   const max = isCompactWorker
     ? (left >= 300 ? 48 : 40)
     : (left >= 300 ? 52 : 44);
@@ -1989,7 +2027,7 @@ function laneLabelForDisplay(lane, left) {
 
   if (!isCompactWorker) return ellipsizeEnd(label, max);
 
-  const prefixMatch = label.match(/^((?:app|queue) (?:worker|thread):\s*)(.+)$/);
+  const prefixMatch = label.match(/^((?:(?:app|queue) (?:worker|thread)|agent job):\s*)(.+)$/);
   if (!prefixMatch) return ellipsizeMiddle(label, max);
   const [, prefix, name] = prefixMatch;
   return `${prefix}${ellipsizeMiddle(name, Math.max(12, max - prefix.length))}`;
