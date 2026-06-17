@@ -1681,6 +1681,279 @@ function launcherWorkerSessions(records, parentId) {
   return result.sort((a, b) => clampNumber(a.start) - clampNumber(b.start));
 }
 
+function queueNamespaceScanDirs(queue) {
+  const dirs = new Set();
+  for (const namespace of queue?.namespaces || []) {
+    const metadata =
+      typeof namespace.metadata_json === "string"
+        ? safeParseJson(namespace.metadata_json, {})
+        : namespace.metadata_json || {};
+    if (metadata && typeof metadata.scan_dir === "string" && metadata.scan_dir.trim()) {
+      dirs.add(metadata.scan_dir.trim());
+    }
+  }
+  return [...dirs];
+}
+
+function listAppServerManifestPaths(source, scanDir) {
+  if (!scanDir) return [];
+  try {
+    if (source?.type === "remote" && source.host) {
+      return sshText(
+        source.host,
+        `find ${shellQuote(scanDir)} -maxdepth 1 -type f -name ${shellQuote("app_server*.json")} -print 2>/dev/null`,
+        2 * 1024 * 1024,
+      )
+        .split(/\n/)
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .sort();
+    }
+
+    return fs
+      .readdirSync(scanDir)
+      .filter((name) => /^app_server.*\.json$/i.test(name))
+      .map((name) => path.join(scanDir, name))
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
+function readJsonFromSource(source, filePath, maxBuffer = 4 * 1024 * 1024) {
+  const read = readTextFromSource(source, filePath, maxBuffer);
+  if (!read.exists || read.error || !read.text.trim()) return null;
+  return safeParseJson(read.text, null);
+}
+
+function appServerManifestRecords(source, queue) {
+  const records = [];
+  const seenManifests = new Set();
+  for (const scanDir of queueNamespaceScanDirs(queue)) {
+    for (const manifestPath of listAppServerManifestPaths(source, scanDir)) {
+      if (seenManifests.has(manifestPath)) continue;
+      seenManifests.add(manifestPath);
+      const manifest = readJsonFromSource(source, manifestPath);
+      if (!manifest) continue;
+
+      const workers = Array.isArray(manifest) ? manifest : manifest.workers;
+      if (!Array.isArray(workers)) continue;
+      const manifestCreatedAt = toMs(manifest.created_at || manifest.createdAt);
+      const manifestNamespace = typeof manifest.namespace === "string" ? manifest.namespace : "";
+      const manifestEphemeral = manifest.ephemeral === true;
+
+      workers.forEach((worker, index) => {
+        if (!worker || typeof worker !== "object") return;
+        const threadId = firstString(worker.thread_id, worker.threadId, worker.completion?.thread_id);
+        const workerId = firstString(worker.worker_id, worker.workerId, worker.worker, worker.thread_name, threadId);
+        const queueName = firstString(worker.queue, worker.queue_name, worker.queueName);
+        const namespace = firstString(worker.namespace, manifestNamespace);
+        if (!workerId && !threadId) return;
+        records.push({
+          ...worker,
+          threadId,
+          workerId,
+          queueName,
+          namespace,
+          manifestPath,
+          manifestIndex: index,
+          manifestCreatedAt,
+          manifestEphemeral,
+        });
+      });
+    }
+  }
+  return records;
+}
+
+function appServerRecordKey(record) {
+  return [record.namespace || "", record.queueName || "", record.workerId || ""].join("\0");
+}
+
+function appServerItemActivityMs(item) {
+  return item?.completed || item?.updated || item?.end || item?.created || null;
+}
+
+function appServerItemsForRecord(record, allRecords, queueItems) {
+  if (!record.namespace || !record.queueName || !record.workerId) return [];
+  const recordCreated = record.manifestCreatedAt;
+  const nextRecord = allRecords
+    .filter((candidate) => candidate !== record && appServerRecordKey(candidate) === appServerRecordKey(record))
+    .filter((candidate) => Number.isFinite(candidate.manifestCreatedAt))
+    .filter((candidate) => !Number.isFinite(recordCreated) || candidate.manifestCreatedAt > recordCreated)
+    .sort((a, b) => a.manifestCreatedAt - b.manifestCreatedAt)[0];
+  const nextCreated = nextRecord?.manifestCreatedAt;
+
+  return (queueItems || []).filter((item) => {
+    if (item.namespace !== record.namespace || item.queueName !== record.queueName) return false;
+    const workerId = item.workerId || item.leaseOwner;
+    if (workerId !== record.workerId) return false;
+    const activity = appServerItemActivityMs(item);
+    if (!Number.isFinite(activity)) return false;
+    if (Number.isFinite(recordCreated) && activity < recordCreated) return false;
+    if (Number.isFinite(nextCreated) && activity >= nextCreated) return false;
+    return true;
+  });
+}
+
+function appServerManifestDetail(record, items, firstObserved, lastObserved) {
+  const completion = record.completion && typeof record.completion === "object" ? record.completion : {};
+  const samples = (items || [])
+    .slice()
+    .sort((a, b) => clampNumber(appServerItemActivityMs(a)) - clampNumber(appServerItemActivityMs(b)))
+    .slice(0, 5)
+    .map((item) =>
+      [
+        `${item.queueName}: ${item.label || item.id}`,
+        item.status ? `status=${item.status}` : "",
+        item.completed ? `completed=${new Date(item.completed).toISOString()}` : "",
+      ]
+        .filter(Boolean)
+        .join(" "),
+    );
+  return [
+    "Ephemeral app-server queue worker",
+    record.workerId ? `Worker ID: ${record.workerId}` : "",
+    record.threadId ? `Thread ID: ${record.threadId}` : "",
+    record.turn_id || record.turnId ? `Turn ID: ${record.turn_id || record.turnId}` : "",
+    record.thread_name || record.threadName ? `Thread name: ${record.thread_name || record.threadName}` : "",
+    record.role ? `Role: ${record.role}` : "",
+    record.queueName ? `Queue: ${record.queueName}` : "",
+    record.namespace ? `Namespace: ${record.namespace}` : "",
+    record.cwd ? `Working directory: ${record.cwd}` : "",
+    Number.isFinite(record.manifestCreatedAt)
+      ? `Manifest created: ${new Date(record.manifestCreatedAt).toISOString()}`
+      : "",
+    Number.isFinite(firstObserved) ? `First observed: ${new Date(firstObserved).toISOString()}` : "",
+    Number.isFinite(lastObserved) ? `Last observed: ${new Date(lastObserved).toISOString()}` : "",
+    `Queue items attributed: ${(items || []).length}`,
+    samples.length ? `Item samples:\n${samples.join("\n")}` : "",
+    completion.status ? `Completion status: ${completion.status}` : "",
+    completion.error ? `Completion error:\n${safeJson(completion.error)}` : "",
+    record.manifestPath ? `Manifest: ${record.manifestPath}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function appServerManifestSessions(source, queue, parentId) {
+  const records = appServerManifestRecords(source, queue);
+  const sessions = [];
+  const seen = new Set();
+  for (const record of records) {
+    const id =
+      record.threadId ||
+      `app-server-worker:${record.namespace || "unknown"}:${record.queueName || "unknown"}:${record.workerId || record.manifestIndex}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+
+    const items = appServerItemsForRecord(record, records, queue?.items || []);
+    const itemActivityPoints = items.map(appServerItemActivityMs).filter(Number.isFinite);
+    const itemFallbackPoints = items
+      .flatMap((item) => [appServerItemActivityMs(item), item.created])
+      .filter(Number.isFinite);
+    const firstObserved = Number.isFinite(record.manifestCreatedAt)
+      ? record.manifestCreatedAt
+      : Math.min(...itemFallbackPoints);
+    const lastActivity = Math.max(...[record.manifestCreatedAt, ...itemActivityPoints].filter(Number.isFinite));
+    if (!Number.isFinite(firstObserved)) continue;
+    const lastObserved = Number.isFinite(lastActivity) && lastActivity > firstObserved ? lastActivity : firstObserved + 1000;
+    const completion = record.completion && typeof record.completion === "object" ? record.completion : {};
+    const status = firstString(completion.status, record.status, "observed");
+    const detail = appServerManifestDetail(record, items, firstObserved, lastObserved);
+    const span = {
+      id: `${id}:manifest`,
+      type: status === "failed" ? "spawn" : "tool",
+      name: "app_server_ephemeral_client",
+      label: items.length ? `processed ${items.length} queue item${items.length === 1 ? "" : "s"}` : "ephemeral client",
+      start: firstObserved,
+      end: lastObserved,
+      durationMs: Math.max(1, lastObserved - firstObserved),
+      wallMs: null,
+      exitCode: null,
+      detail: clipSpanDetail(detail),
+    };
+    const markers = [
+      appThreadMarker(firstObserved, "app worker started", detail),
+      appThreadMarker(lastObserved, `app worker ${status}`, detail),
+    ];
+    const elapsedMs = Math.max(0, lastObserved - firstObserved);
+    const busyMs = unionMs([span]);
+
+    sessions.push({
+      id,
+      title: record.workerId || record.thread_name || record.threadName || id,
+      updatedAt: new Date(lastObserved).toISOString(),
+      filePath: record.manifestPath || "app_server worker manifest",
+      meta: {
+        id,
+        parentThreadId: parentId || null,
+        cwd: record.cwd || "",
+        source: {
+          app_server: {
+            thread_id: record.threadId || "",
+            turn_id: record.turn_id || record.turnId || "",
+            worker_id: record.workerId || "",
+            queue: record.queueName || "",
+            role: record.role || "",
+            namespace: record.namespace || "",
+            thread_name: record.thread_name || record.threadName || "",
+            created_via: "app_server_queue_pool manifest",
+            ephemeral: record.ephemeral === true || record.manifestEphemeral === true,
+            completion_status: status,
+            manifest_path: record.manifestPath || "",
+            queue_item_count: items.length,
+            timing_source:
+              "Derived from app_server*.json scan manifests and matching Queue Service item activity.",
+          },
+        },
+        threadSource: "app_server",
+        originator: "app_server_queue_pool",
+        agentNickname: record.workerId || "",
+        agentRole: "app worker",
+      },
+      start: firstObserved,
+      end: lastObserved,
+      elapsedMs,
+      metrics: {
+        waitMs: 0,
+        toolMs: busyMs,
+        quietMs: Math.max(0, elapsedMs - busyMs),
+        busyMs,
+        spanCount: 1,
+        eventCount: markers.length + items.length,
+      },
+      eventCounts: {
+        "app_server/manifest_worker": 1,
+        "queue/items_attributed": items.length,
+      },
+      spans: [span],
+      markers: normalizedMarkers(markers),
+      spawned: [],
+      namespaces: record.namespace ? [record.namespace] : [],
+      appServerThread: true,
+    });
+  }
+
+  return sessions.sort((a, b) => clampNumber(a.start) - clampNumber(b.start));
+}
+
+function mergeAppThreadSessions(primary, secondary) {
+  const byId = new Map();
+  for (const session of [...(primary || []), ...(secondary || [])]) {
+    if (!session?.id) continue;
+    if (!byId.has(session.id)) {
+      byId.set(session.id, session);
+      continue;
+    }
+    const existing = byId.get(session.id);
+    if (clampNumber(session.metrics?.spanCount) > clampNumber(existing.metrics?.spanCount)) {
+      byId.set(session.id, session);
+    }
+  }
+  return [...byId.values()].sort((a, b) => clampNumber(a.start) - clampNumber(b.start));
+}
+
 function normalizedMarkers(markers) {
   const result = [];
   for (const marker of markers.sort((a, b) => clampNumber(a.ts) - clampNumber(b.ts))) {
@@ -1799,6 +2072,10 @@ function parseSessionRows(rows, filePath, indexEntry) {
       markers.push(makeMarker(ts, "goal", payload.goal?.status || "goal", payload));
     } else if (row.type === "compacted" || payloadType === "context_compacted") {
       markers.push(makeMarker(ts, "compact", "compacted", payload));
+    }
+
+    if (payloadType === "mcp_tool_call_end") {
+      for (const namespace of collectMcpToolNamespaces(payload)) namespaces.add(namespace);
     }
 
     const isCall =
@@ -2008,6 +2285,43 @@ function collectNamespaces(value, result = new Set()) {
     for (const item of value.items) collectNamespaces(item, result);
   }
   if (value.queue) collectNamespaces(value.queue, result);
+  return result;
+}
+
+function collectMcpToolNamespaces(payload, result = new Set()) {
+  if (!payload || typeof payload !== "object") return result;
+  const invocation = payload.invocation || {};
+  const server = invocation.server || "";
+  const tool = invocation.tool || "";
+  if (server !== "queue-service" && !String(payload.plugin_id || "").includes("queue-service")) {
+    return result;
+  }
+
+  collectNamespaces(invocation.arguments, result);
+
+  const resultTools = new Set([
+    "queue_namespace_start",
+    "queue_namespace_close",
+    "queue_create",
+    "queue_enqueue",
+    "queue_enqueue_bulk",
+    "queue_claim_next",
+    "queue_complete",
+    "queue_fail",
+    "queue_get_item",
+  ]);
+  if (!resultTools.has(tool)) return result;
+
+  collectNamespaces(payload.result?.structuredContent, result);
+  collectNamespaces(payload.result?.Ok?.structuredContent, result);
+
+  const content = payload.result?.content || payload.result?.Ok?.content || [];
+  for (const part of Array.isArray(content) ? content : []) {
+    if (typeof part?.text !== "string") continue;
+    const parsed = safeParseJson(part.text, null);
+    if (parsed) collectNamespaces(parsed, result);
+  }
+
   return result;
 }
 
@@ -2515,11 +2829,13 @@ function loadCodexSecurityQueueDataFromDb(dbPath, jobIds) {
     let result = {};
     try {
       payload = item.input_json ? JSON.parse(item.input_json) : {};
+      if (!payload || typeof payload !== "object") payload = {};
     } catch {
       payload = {};
     }
     try {
       result = item.result_json ? JSON.parse(item.result_json) : {};
+      if (!result || typeof result !== "object") result = {};
     } catch {
       result = {};
     }
@@ -2799,11 +3115,13 @@ function loadQueueDataFromDb(dbPath, sessionId, namespaceHints) {
     let result = {};
     try {
       payload = item.payload_json ? JSON.parse(item.payload_json) : {};
+      if (!payload || typeof payload !== "object") payload = {};
     } catch {
       payload = {};
     }
     try {
       result = item.result_json ? JSON.parse(item.result_json) : {};
+      if (!result || typeof result !== "object") result = {};
     } catch {
       result = {};
     }
@@ -3321,7 +3639,10 @@ function augmentRunningToolDiagnostics(parent, children, source) {
 }
 
 function completeSessionPayload({ codexHome, source, parent, children, queue }) {
-  const appThreads = parent.appThreads || [];
+  const appThreads = mergeAppThreadSessions(
+    parent.appThreads || [],
+    appServerManifestSessions(source, queue, parent.id),
+  );
   const queueWorkers = queue.workers || [];
   augmentRunningToolDiagnostics(parent, children, source);
   for (const child of children) {

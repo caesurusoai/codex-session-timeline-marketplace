@@ -1,6 +1,6 @@
 {
   "name": "codex-session-timeline",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "private": true,
   "description": "Local Codex session timing and queue visualization dashboard.",
   "type": "commonjs",

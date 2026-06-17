@@ -1,6 +1,6 @@
 {
   "name": "codex-session-timeline",
-  "version": "0.2.1+codex.20260615165823",
+  "version": "0.2.2+codex.20260617173158",
   "description": "Visualize Codex session timing, tool waits, subagents, and queue activity.",
   "author": {
     "name": "Local developer"
